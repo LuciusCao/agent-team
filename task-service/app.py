@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""
+Task Management Service
+FastAPI + PostgreSQL
+"""
+
+import os
+import json
+from datetime import datetime
+from typing import Optional, List
+from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+import asyncpg
+
+app = FastAPI(title="Task Management Service")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Database connection pool
+DB_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/taskmanager")
+
+pool: Optional[asyncpg.Pool] = None
+
+
+async def get_db():
+    global pool
+    if pool is None:
+        pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
+    return pool
+
+
+# Pydantic models
+class ProjectCreate(BaseModel):
+    name: str
+    discord_channel_id: Optional[str] = None
+    description: Optional[str] = None
+
+
+class TaskCreate(BaseModel):
+    project_id: int
+    title: str
+    description: Optional[str] = None
+    task_type: str
+    assignee_agent: Optional[str] = None
+    reviewer_id: Optional[str] = None
+    reviewer_mention: Optional[str] = None
+    acceptance_criteria: Optional[str] = None
+    parent_task_id: Optional[int] = None
+    dependencies: Optional[List[int]] = None
+    created_by: Optional[str] = None
+    due_at: Optional[str] = None
+
+
+class TaskUpdate(BaseModel):
+    status: Optional[str] = None
+    result: Optional[dict] = None
+    assignee_agent: Optional[str] = None
+
+
+class TaskReview(BaseModel):
+    approved: bool
+    feedback: Optional[str] = None
+
+
+# API Routes
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "task-management"}
+
+
+@app.post("/projects")
+async def create_project(project: ProjectCreate, db=Depends(get_db)):
+    async with db.acquire() as conn:
+        result = await conn.fetchrow(
+            """
+            INSERT INTO projects (name, discord_channel_id, description)
+            VALUES ($1, $2, $3)
+            RETURNING id, name, discord_channel_id, description, created_at
+            """,
+            project.name, project.discord_channel_id, project.description
+        )
+    return result
+
+
+@app.get("/projects")
+async def list_projects(db=Depends(get_db)):
+    async with db.acquire() as conn:
+        results = await conn.fetch("SELECT * FROM projects ORDER BY created_at DESC")
+    return results
+
+
+@app.get("/projects/{project_id}")
+async def get_project(project_id: int, db=Depends(get_db)):
+    async with db.acquire() as conn:
+        project = await conn.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@app.post("/tasks")
+async def create_task(task: TaskCreate, db=Depends(get_db)):
+    async with db.acquire() as conn:
+        result = await conn.fetchrow(
+            """
+            INSERT INTO tasks (
+                project_id, title, description, task_type,
+                assignee_agent, reviewer_id, reviewer_mention, acceptance_criteria,
+                parent_task_id, dependencies, created_by, due_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            RETURNING *
+            """,
+            task.project_id, task.title, task.description, task.task_type,
+            task.assignee_agent, task.reviewer_id, task.reviewer_mention,
+            task.acceptance_criteria, task.parent_task_id,
+            task.dependencies, task.created_by, task.due_at
+        )
+        
+        # Log the creation
+        await conn.execute(
+            "INSERT INTO task_logs (task_id, action, message, actor) VALUES ($1, $2, $3, $4)",
+            result["id"], "created", f"Task created: {task.title}", task.created_by or "system"
+        )
+    return result
+
+
+@app.get("/tasks")
+async def list_tasks(
+    project_id: Optional[int] = None,
+    status: Optional[str] = None,
+    assignee: Optional[str] = None,
+    db=Depends(get_db)
+):
+    query = "SELECT * FROM tasks WHERE 1=1"
+    params = []
+    
+    if project_id:
+        params.append(project_id)
+        query += f" AND project_id = ${len(params)}"
+    if status:
+        params.append(status)
+        query += f" AND status = ${len(params)}"
+    if assignee:
+        params.append(assignee)
+        query += f" AND assignee_agent = ${len(params)}"
+    
+    query += " ORDER BY created_at DESC"
+    
+    async with db.acquire() as conn:
+        results = await conn.fetch(query, *params)
+    return results
+
+
+@app.get("/tasks/{task_id}")
+async def get_task(task_id: int, db=Depends(get_db)):
+    async with db.acquire() as conn:
+        task = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+        logs = await conn.fetch(
+            "SELECT * FROM task_logs WHERE task_id = $1 ORDER BY created_at DESC",
+            task_id
+        )
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"task": dict(task), "logs": [dict(l) for l in logs]}
+
+
+@app.patch("/tasks/{task_id}")
+async def update_task(task_id: int, update: TaskUpdate, db=Depends(get_db)):
+    async with db.acquire() as conn:
+        # Get current task
+        current = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+        if not current:
+            raise HTTPException(status_code=404, detail="Task not found")
+        
+        # Build update query
+        updates = []
+        params = []
+        param_num = 1
+        
+        if update.status is not None:
+            updates.append(f"status = ${param_num}")
+            params.append(update.status)
+            param_num += 1
+            
+            # Update completed_at if completing
+            if update.status == "completed":
+                updates.append("completed_at = NOW()")
+        
+        if update.result is not None:
+            updates.append(f"result = ${param_num}")
+            params.append(json.dumps(update.result))
+            param_num += 1
+        
+        if update.assignee_agent is not None:
+            updates.append(f"assignee_agent = ${param_num}")
+            params.append(update.assignee_agent)
+            param_num += 1
+        
+        if not updates:
+            return current
+        
+        updates.append("updated_at = NOW()")
+        params.append(task_id)
+        
+        query = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ${param_num} RETURNING *"
+        
+        result = await conn.fetchrow(query, *params)
+        
+        # Log the update
+        await conn.execute(
+            """
+            INSERT INTO task_logs (task_id, action, old_status, new_status, message)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            task_id, "status_changed", current["status"], update.status or current["status"],
+            f"Task updated: {update.dict(exclude_none=True)}"
+        )
+    
+    return result
+
+
+@app.post("/tasks/{task_id}/review")
+async def review_task(task_id: int, review: TaskReview, db=Depends(get_db)):
+    async with db.acquire() as conn:
+        task = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        
+        if review.approved:
+            new_status = "completed"
+        else:
+            new_status = "running"
+        
+        await conn.execute(
+            "UPDATE tasks SET status = $1, feedback = $2, updated_at = NOW() WHERE id = $3",
+            new_status, review.feedback, task_id
+        )
+        
+        # Log the review
+        await conn.execute(
+            """
+            INSERT INTO task_logs (task_id, action, old_status, new_status, message)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            task_id, "reviewed", task["status"], new_status,
+            f"Reviewed: {'approved' if review.approved else 'rejected'}. Feedback: {review.feedback}"
+        )
+        
+        updated = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+    
+    return updated
+
+
+@app.get("/projects/{project_id}/tasks")
+async def get_project_tasks(project_id: int, db=Depends(get_db)):
+    async with db.acquire() as conn:
+        results = await conn.fetch(
+            "SELECT * FROM tasks WHERE project_id = $1 ORDER BY created_at DESC",
+            project_id
+        )
+    return results
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)
