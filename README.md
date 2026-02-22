@@ -272,3 +272,89 @@ curl -X POST http://localhost:8080/agents/researcher/heartbeat
 ```
 
 超过 5 分钟没有心跳的 Agent 会被自动设为 offline。
+
+---
+
+### Agent 频道注册机制
+
+#### 设计目标
+
+当用户在 Discord 频道中 @Agent 时，Agent 自动注册到该频道，表示"我可以响应这个频道的任务"。
+
+#### 数据库设计
+
+```sql
+-- Agent 活跃频道表
+CREATE TABLE IF NOT EXISTS agent_channels (
+    id SERIAL PRIMARY KEY,
+    agent_name VARCHAR(100) NOT NULL,
+    channel_id VARCHAR(50) NOT NULL,
+    last_seen TIMESTAMP DEFAULT NOW(),
+    UNIQUE(agent_name, channel_id)
+);
+```
+
+#### 注册流程
+
+```
+1. 用户在频道中 @researcher
+2. Agent 收到消息，调用 skill
+3. Skill 调用 Task Service API:
+   - POST /agents/register (首次注册/更新)
+   - POST /agent_channels (记录频道活跃)
+4. 返回注册结果
+```
+
+#### API 端点（新增）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | /agents/register | 注册 Agent（带 channel_id） |
+| POST | /agent-channels | 记录 Agent 活跃频道 |
+| GET | /agents/{name}/channels | 查询 Agent 活跃的所有频道 |
+| DELETE | /agent-channels | 移除 Agent 在某频道的活跃状态 |
+
+#### Skill 设计
+
+**Skill 1: agent-register（注册）**
+- 触发：用户在频道中 @Agent
+- 行为：
+  1. 解析 agent name 和 channel id
+  2. 调用 /agents/register
+  3. 调用 /agent-channels 创建记录
+  4. 回复用户确认
+
+**Skill 2: agent-unregister（移除）**
+- 触发：用户说"移除 @agent" 或 "取消 @agent 的资格"
+- 行为：
+  1. 解析 agent name 和 channel id
+  2. 调用 DELETE /agent-channels
+  3. 回复用户确认
+
+#### 使用示例
+
+```
+# 用户在 #ai项目 频道说:
+@researcher 注册
+
+# Agent 回复:
+✅ researcher 已注册到 #ai项目
+   - 角色: research
+   - 能力: web_search, browser
+
+# 用户说:
+移除 @researcher
+
+# Agent 回复:
+✅ researcher 已从 #ai项目 移除
+```
+
+#### 查询可用 Agent
+
+```bash
+# 查询某频道有哪些可用 Agent
+GET /agents?channel_id=123456
+
+# 查询 Agent 在哪些频道活跃
+GET /agents/researcher/channels
+```

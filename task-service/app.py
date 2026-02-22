@@ -50,6 +50,12 @@ class AgentHeartbeat(BaseModel):
     name: str
 
 
+class AgentChannel(BaseModel):
+    """Agent 在某频道活跃的记录"""
+    agent_name: str
+    channel_id: str
+
+
 class ProjectCreate(BaseModel):
     name: str
     discord_channel_id: Optional[str] = None
@@ -351,6 +357,77 @@ async def unregister_agent(name: str, db=Depends(get_db)):
     async with db.acquire() as conn:
         await conn.execute("DELETE FROM agents WHERE name = $1", name)
     return {"message": f"Agent {name} unregistered"}
+
+
+# ============ Agent Channel Endpoints ============
+
+@app.post("/agent-channels")
+async def register_agent_channel(ac: AgentChannel, db=Depends(get_db)):
+    """记录 Agent 在某频道活跃"""
+    async with db.acquire() as conn:
+        # 先确保 agent 存在
+        agent = await conn.fetchrow("SELECT * FROM agents WHERE name = $1", ac.agent_name)
+        if not agent:
+            # 自动注册 agent
+            await conn.execute(
+                """
+                INSERT INTO agents (name, role, status, last_heartbeat)
+                VALUES ($1, 'unknown', 'online', NOW())
+                ON CONFLICT (name) DO NOTHING
+                """,
+                ac.agent_name
+            )
+        
+        # 记录频道活跃
+        result = await conn.fetchrow(
+            """
+            INSERT INTO agent_channels (agent_name, channel_id, last_seen)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (agent_name, channel_id) 
+            DO UPDATE SET last_seen = NOW()
+            RETURNING *
+            """,
+            ac.agent_name, ac.channel_id
+        )
+    return result
+
+
+@app.get("/agents/{name}/channels")
+async def get_agent_channels(name: str, db=Depends(get_db)):
+    """查询 Agent 活跃的所有频道"""
+    async with db.acquire() as conn:
+        results = await conn.fetch(
+            "SELECT * FROM agent_channels WHERE agent_name = $1 ORDER BY last_seen DESC",
+            name
+        )
+    return results
+
+
+@app.get("/channels/{channel_id}/agents")
+async def get_channel_agents(channel_id: str, db=Depends(get_db)):
+    """查询某频道的所有活跃 Agent"""
+    async with db.acquire() as conn:
+        results = await conn.fetch(
+            """
+            SELECT a.* FROM agents a
+            JOIN agent_channels ac ON a.name = ac.agent_name
+            WHERE ac.channel_id = $1 AND a.status = 'online'
+            ORDER BY ac.last_seen DESC
+            """,
+            channel_id
+        )
+    return results
+
+
+@app.delete("/agent-channels")
+async def unregister_agent_channel(ac: AgentChannel, db=Depends(get_db)):
+    """移除 Agent 在某频道的活跃状态"""
+    async with db.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM agent_channels WHERE agent_name = $1 AND channel_id = $2",
+            ac.agent_name, ac.channel_id
+        )
+    return {"message": f"Agent {ac.agent_name} removed from channel {ac.channel_id}"}
 
 
 # ============ Background Tasks ============

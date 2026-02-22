@@ -70,3 +70,14 @@ CREATE INDEX idx_tasks_status ON tasks(status);
 CREATE INDEX idx_tasks_assignee ON tasks(assignee_agent);
 CREATE INDEX idx_tasks_reviewer ON tasks(reviewer_id);
 CREATE INDEX idx_task_logs_task_id ON task_logs(task_id);
+
+-- Agent 活跃频道表
+CREATE TABLE IF NOT EXISTS agent_channels (
+    id SERIAL PRIMARY KEY,
+    agent_name VARCHAR(100) NOT NULL,
+    channel_id VARCHAR(50) NOT NULL,
+    last_seen TIMESTAMP DEFAULT NOW(),
+    UNIQUE(agent_name, channel_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_channels_agent ON agent_channels(agent_name);
+CREATE INDEX IF NOT EXISTS idx_agent_channels_channel ON agent_channels(channel_id);
