@@ -1,0 +1,31 @@
+# Agent Team 管理脚本
+# 用法: agent <command> [agent-name]
+# 例: 
+#   agent config researcher
+#   agent start researcher
+
+COMMAND=$1
+AGENT=$2
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+case "$COMMAND" in
+    config)
+        [ -z "$AGENT" ] && echo "用法: agent config <name>" && exit 1
+        cd "$SCRIPT_DIR" && bash ./scripts/config.sh "$AGENT"
+        ;;
+    start)
+        cd "$SCRIPT_DIR" && bash ./scripts/start.sh "$AGENT"
+        ;;
+    stop)
+        cd "$SCRIPT_DIR" && bash ./scripts/stop.sh "$AGENT"
+        ;;
+    create)
+        [ -z "$AGENT" ] && echo "用法: agent create <name>" && exit 1
+        cd "$SCRIPT_DIR" && bash ./scripts/create.sh "$AGENT"
+        ;;
+    *)
+        echo "用法: agent <command> [name]"
+        echo "命令: config, start, stop, create"
+        ;;
+esac

@@ -1,0 +1,41 @@
+# ZeroClaw Agent 配置模板
+
+workspace_dir = "/zeroclaw-data/workspace"
+config_path = "/zeroclaw-data/.zeroclaw/config.toml"
+
+# LLM 配置
+api_key = ""
+default_provider = "kimi-code"
+default_model = "kimi-k2.5"
+default_temperature = 0.7
+
+[gateway]
+port = 42617
+host = "[::]"
+allow_public_bind = true
+
+# Agent 配置
+[agent]
+compact_context = true
+max_tool_iterations = 10
+max_history_messages = 50
+
+# Browser 配置
+[browser]
+enabled = true
+
+# Heartbeat 配置
+[heartbeat]
+enabled = true
+interval_minutes = 30
+
+# Channel 配置
+[channels_config]
+cli = true
+
+# Discord
+[channels_config.discord]
+bot_token = ""
+guild_id = ""
+allowed_users = ["*"]
+mention_only = true

@@ -1,0 +1,36 @@
+# ZeroClaw Agent
+
+services:
+  zeroclaw-agent:
+    image: ghcr.io/zeroclaw-labs/zeroclaw:latest
+    container_name: zeroclaw-${AGENT_NAME:-agent}
+    command: ["daemon"]
+    restart: unless-stopped
+    
+    environment:
+      - ZEROCLAW_RUNTIME_KIND=${ZEROCLAW_RUNTIME_KIND:-docker}
+      - ZEROCLAW_ALLOW_PUBLIC_BIND=${ZEROCLAW_ALLOW_PUBLIC_BIND:-true}
+      - SHELL=/bin/bash
+      
+    volumes:
+      - zeroclaw-data:/zeroclaw-data
+      - ${PROJECT_ROOT}/agents/${AGENT_NAME}/workspace:/zeroclaw-data/workspace
+      - ${PROJECT_ROOT}/agents/${AGENT_NAME}/config.toml:/zeroclaw-data/.zeroclaw/config.toml:ro
+      
+    ports:
+      - "${PORT:-43001}:42617"
+    
+    deploy:
+      resources:
+        limits:
+          cpus: ${CPU_LIMIT:-1}
+          memory: ${MEMORY_LIMIT:-1G}
+
+    healthcheck:
+      test: ["CMD", "zeroclaw", "status"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  zeroclaw-data:
