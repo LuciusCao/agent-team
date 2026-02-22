@@ -37,6 +37,19 @@ async def get_db():
 
 
 # Pydantic models
+
+## Agent
+class AgentRegister(BaseModel):
+    name: str
+    discord_user_id: Optional[str] = None
+    role: str  # research, copywrite, video, coordinator
+    capabilities: Optional[dict] = None
+
+
+class AgentHeartbeat(BaseModel):
+    name: str
+
+
 class ProjectCreate(BaseModel):
     name: str
     discord_channel_id: Optional[str] = None
@@ -266,6 +279,109 @@ async def get_project_tasks(project_id: int, db=Depends(get_db)):
             project_id
         )
     return results
+
+
+# ============ Agent Endpoints ============
+
+@app.post("/agents/register")
+async def register_agent(agent: AgentRegister, db=Depends(get_db)):
+    """注册 Agent"""
+    async with db.acquire() as conn:
+        result = await conn.fetchrow(
+            """
+            INSERT INTO agents (name, discord_user_id, role, capabilities, status, last_heartbeat)
+            VALUES ($1, $2, $3, $4, 'online', NOW())
+            ON CONFLICT (name) DO UPDATE SET
+                discord_user_id = EXCLUDED.discord_user_id,
+                role = EXCLUDED.role,
+                capabilities = EXCLUDED.capabilities,
+                status = 'online',
+                last_heartbeat = NOW()
+            RETURNING *
+            """,
+            agent.name, agent.discord_user_id, agent.role,
+            json.dumps(agent.capabilities) if agent.capabilities else None
+        )
+    return result
+
+
+@app.post("/agents/{name}/heartbeat")
+async def agent_heartbeat(name: str, db=Depends(get_db)):
+    """Agent 心跳"""
+    async with db.acquire() as conn:
+        result = await conn.fetchrow(
+            """
+            UPDATE agents SET status = 'online', last_heartbeat = NOW()
+            WHERE name = $1 RETURNING *
+            """,
+            name
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Agent not found")
+    return result
+
+
+@app.get("/agents")
+async def list_agents(status: Optional[str] = None, db=Depends(get_db)):
+    """列出可用 Agent"""
+    async with db.acquire() as conn:
+        if status:
+            results = await conn.fetch(
+                "SELECT * FROM agents WHERE status = $1 ORDER BY name",
+                status
+            )
+        else:
+            results = await conn.fetch("SELECT * FROM agents ORDER BY name")
+    return results
+
+
+@app.get("/agents/{name}")
+async def get_agent(name: str, db=Depends(get_db)):
+    """获取 Agent 详情"""
+    async with db.acquire() as conn:
+        agent = await conn.fetchrow("SELECT * FROM agents WHERE name = $1", name)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+    return agent
+
+
+@app.delete("/agents/{name}")
+async def unregister_agent(name: str, db=Depends(get_db)):
+    """注销 Agent"""
+    async with db.acquire() as conn:
+        await conn.execute("DELETE FROM agents WHERE name = $1", name)
+    return {"message": f"Agent {name} unregistered"}
+
+
+# ============ Background Tasks ============
+
+import asyncio
+
+@app.on_event("startup")
+async def startup_event():
+    """启动后台任务"""
+    asyncio.create_task(heartbeat_monitor())
+
+
+async def heartbeat_monitor():
+    """监控 Agent 心跳，超时设为 offline"""
+    while True:
+        await asyncio.sleep(60)  # 每分钟检查一次
+        try:
+            pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=1)
+            async with pool.acquire() as conn:
+                # 将 5 分钟没有心跳的 Agent 设为 offline
+                await conn.execute(
+                    """
+                    UPDATE agents 
+                    SET status = 'offline'
+                    WHERE status = 'online' 
+                    AND last_heartbeat < NOW() - INTERVAL '5 minutes'
+                    """
+                )
+            await pool.close()
+        except Exception as e:
+            print(f"Heartbeat monitor error: {e}")
 
 
 if __name__ == "__main__":

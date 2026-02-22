@@ -237,3 +237,38 @@ docker exec -it taskmanager-db psql -U taskmanager -d taskmanager -f /docker-ent
 # 测试
 curl http://localhost:8080/
 ```
+
+### Agent 注册与心跳
+
+#### API 端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | /agents/register | 注册 Agent |
+| POST | /agents/{name}/heartbeat | Agent 心跳 |
+| GET | /agents | 列出 Agent |
+| GET | /agents/{name} | Agent 详情 |
+| DELETE | /agents/{name} | 注销 Agent |
+
+#### 注册 Agent
+
+```bash
+curl -X POST http://localhost:8080/agents/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "researcher",
+    "discord_user_id": "123456789",
+    "role": "research",
+    "capabilities": {"web_search": true, "browser": true}
+  }'
+```
+
+#### 心跳
+
+Agent 需要每分钟发送心跳：
+
+```bash
+curl -X POST http://localhost:8080/agents/researcher/heartbeat
+```
+
+超过 5 分钟没有心跳的 Agent 会被自动设为 offline。

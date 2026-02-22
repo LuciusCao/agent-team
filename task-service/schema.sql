@@ -50,7 +50,21 @@ CREATE TABLE IF NOT EXISTS task_logs (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Agent 注册表
+CREATE TABLE IF NOT EXISTS agents (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    discord_user_id VARCHAR(100),
+    role VARCHAR(50) CHECK (role IN ('research', 'copywrite', 'video', 'coordinator')),
+    status VARCHAR(20) DEFAULT 'offline' CHECK (status IN ('online', 'offline')),
+    capabilities JSONB,
+    last_heartbeat TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
 -- 索引
+CREATE INDEX idx_agents_name ON agents(name);
+CREATE INDEX idx_agents_status ON agents(status);
 CREATE INDEX idx_tasks_project_id ON tasks(project_id);
 CREATE INDEX idx_tasks_status ON tasks(status);
 CREATE INDEX idx_tasks_assignee ON tasks(assignee_agent);
