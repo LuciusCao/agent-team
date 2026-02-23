@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""
+Task Service CLI - 供 Agent 调用的命令行工具
+"""
+
+import os
+import sys
+import json
+import requests
+
+TASK_SERVICE_URL = os.getenv("TASK_SERVICE_URL", "http://task-service:8080")
+AGENT_NAME = os.getenv("AGENT_NAME", os.getenv("AGENT_NAME", "agent"))
+
+
+def get_available_tasks():
+    """获取可认领的任务"""
+    resp = requests.get(f"{TASK_SERVICE_URL}/tasks/available")
+    resp.raise_for_status()
+    return resp.json()
+
+
+def claim_task(task_id: int):
+    """认领任务"""
+    resp = requests.post(
+        f"{TASK_SERVICE_URL}/tasks/{task_id}/claim",
+        params={"agent_name": AGENT_NAME}
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def release_task(task_id: int):
+    """释放任务"""
+    resp = requests.post(
+        f"{TASK_SERVICE_URL}/tasks/{task_id}/release",
+        params={"agent_name": AGENT_NAME}
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_my_tasks():
+    """获取我的任务"""
+    resp = requests.get(
+        f"{TASK_SERVICE_URL}/tasks",
+        params={"assignee": AGENT_NAME}
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def update_task(task_id: int, status: str = None, result: dict = None):
+    """更新任务状态"""
+    data = {}
+    if status:
+        data["status"] = status
+    if result:
+        data["result"] = result
+    
+    resp = requests.patch(
+        f"{TASK_SERVICE_URL}/tasks/{task_id}",
+        json=data
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: task <command> [args...]")
+        print("Commands:")
+        print("  available              # 查看可认领的任务")
+        print("  claim <task_id>       # 认领任务")
+        print("  release <task_id>      # 释放任务")
+        print("  mine                   # 查看我的任务")
+        print("  update <task_id> <status> [result_json]")
+        sys.exit(1)
+    
+    cmd = sys.argv[1]
+    
+    try:
+        if cmd == "available":
+            tasks = get_available_tasks()
+            print(json.dumps(tasks, indent=2, ensure_ascii=False))
+        
+        elif cmd == "claim":
+            task_id = int(sys.argv[2])
+            result = claim_task(task_id)
+            print(f"✅ 已认领任务 #{task_id}")
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        
+        elif cmd == "release":
+            task_id = int(sys.argv[2])
+            release_task(task_id)
+            print(f"✅ 已释放任务 #{task_id}")
+        
+        elif cmd == "mine":
+            tasks = get_my_tasks()
+            print(json.dumps(tasks, indent=2, ensure_ascii=False))
+        
+        elif cmd == "update":
+            task_id = int(sys.argv[2])
+            status = sys.argv[3] if len(sys.argv) > 3 else None
+            result = json.loads(sys.argv[4]) if len(sys.argv) > 4 else None
+            updated = update_task(task_id, status, result)
+            print(f"✅ 已更新任务 #{task_id}")
+            print(json.dumps(updated, indent=2, ensure_ascii=False))
+        
+        else:
+            print(f"Unknown command: {cmd}")
+            sys.exit(1)
+    
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

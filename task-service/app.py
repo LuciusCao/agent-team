@@ -150,8 +150,79 @@ async def create_task(task: TaskCreate, db=Depends(get_db)):
     return result
 
 
-@app.get("/tasks")
-async def list_tasks(
+@app.get("/tasks/available")
+async def get_available_tasks(db=Depends(get_db)):
+    """获取可认领的任务（pending状态，没有 assignee）"""
+    async with db.acquire() as conn:
+        results = await conn.fetch(
+            """
+            SELECT * FROM tasks 
+            WHERE status = 'pending' AND assignee_agent IS NULL
+            ORDER BY created_at DESC
+            """
+        )
+    return results
+
+
+@app.post("/tasks/{task_id}/claim")
+async def claim_task(task_id: int, agent_name: str, db=Depends(get_db)):
+    """Agent 认领任务"""
+    async with db.acquire() as conn:
+        # 检查任务是否存在且可认领
+        task = await conn.fetchrow(
+            "SELECT * FROM tasks WHERE id = $1 AND status = 'pending' AND assignee_agent IS NULL",
+            task_id
+        )
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在或已被认领")
+        
+        # 认领任务
+        result = await conn.fetchrow(
+            """
+            UPDATE tasks 
+            SET assignee_agent = $1, status = 'running', updated_at = NOW()
+            WHERE id = $2
+            RETURNING *
+            """,
+            agent_name, task_id
+        )
+        
+        # 记录日志
+        await conn.execute(
+            "INSERT INTO task_logs (task_id, action, old_status, new_status, message, actor) VALUES ($1, $2, $3, $4, $5, $6)",
+            task_id, "claimed", "pending", "running", f"Task claimed by {agent_name}", agent_name
+        )
+    
+    return result
+
+
+@app.post("/tasks/{task_id}/release")
+async def release_task(task_id: int, agent_name: str, db=Depends(get_db)):
+    """Agent 释放任务（重新变成 pending）"""
+    async with db.acquire() as conn:
+        task = await conn.fetchrow(
+            "SELECT * FROM tasks WHERE id = $1 AND assignee_agent = $2",
+            task_id, agent_name
+        )
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在或不是你认领的")
+        
+        result = await conn.fetchrow(
+            """
+            UPDATE tasks 
+            SET assignee_agent = NULL, status = 'pending', updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            """,
+            task_id
+        )
+        
+        await conn.execute(
+            "INSERT INTO task_logs (task_id, action, old_status, new_status, message, actor) VALUES ($1, $2, $3, $4, $5, $6)",
+            task_id, "released", "running", "pending", f"Task released by {agent_name}", agent_name
+        )
+    
+    return result
     project_id: Optional[int] = None,
     status: Optional[str] = None,
     assignee: Optional[str] = None,
