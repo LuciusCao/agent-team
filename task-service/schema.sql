@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 扩展: 预计工时
     estimated_hours FLOAT,
     
+    -- 扩展: 任务超时（分钟），NULL 表示使用默认值
+    timeout_minutes INTEGER,
+    
     -- 扩展: 重试机制
     retry_count INTEGER DEFAULT 0,
     max_retries INTEGER DEFAULT 3,
@@ -108,6 +111,30 @@ CREATE TABLE IF NOT EXISTS agent_channels (
     UNIQUE(agent_name, channel_id)
 );
 
+-- 任务类型默认配置表
+CREATE TABLE IF NOT EXISTS task_type_defaults (
+    task_type VARCHAR(50) PRIMARY KEY,
+    timeout_minutes INTEGER DEFAULT 120,
+    max_retries INTEGER DEFAULT 3,
+    priority INTEGER DEFAULT 5,
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- 插入默认配置
+INSERT INTO task_type_defaults (task_type, timeout_minutes, max_retries, priority) VALUES
+    ('research', 120, 3, 5),
+    ('copywrite', 60, 3, 5),
+    ('video', 240, 3, 5),
+    ('review', 30, 2, 8),
+    ('publish', 30, 2, 7),
+    ('analysis', 90, 3, 5),
+    ('design', 180, 3, 5),
+    ('development', 180, 3, 5),
+    ('testing', 120, 3, 5),
+    ('deployment', 60, 2, 7),
+    ('coordination', 60, 2, 6)
+ON CONFLICT (task_type) DO NOTHING;
+
 -- ========== v1.1 Migration: Add columns if upgrading ==========
 
 -- 任务表扩展字段
@@ -129,6 +156,12 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                    WHERE table_name = 'tasks' AND column_name = 'estimated_hours') THEN
         ALTER TABLE tasks ADD COLUMN estimated_hours FLOAT;
+    END IF;
+    
+    -- 检查并添加 timeout_minutes 列
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                   WHERE table_name = 'tasks' AND column_name = 'timeout_minutes') THEN
+        ALTER TABLE tasks ADD COLUMN timeout_minutes INTEGER;
     END IF;
     
     -- 检查并添加 retry_count 列

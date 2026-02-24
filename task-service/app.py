@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Task Management Service v1.1
+Task Management Service v1.2
 FastAPI + PostgreSQL
-Agent Workforce Extensions
+Agent Workforce Extensions + Configurable Timeouts + Structured Logging
 """
 
 import os
 import json
 import asyncio
+import logging
+import sys
 from datetime import datetime, timedelta
 from typing import Optional, List
 from pydantic import BaseModel
@@ -16,7 +18,52 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 import asyncpg
 
-app = FastAPI(title="Task Management Service", version="1.1.0")
+# ============ Structured Logging ============
+
+class JSONFormatter(logging.Formatter):
+    """JSON 格式日志格式化器"""
+    def format(self, record):
+        log_obj = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        
+        # 添加额外字段
+        if hasattr(record, "agent_name"):
+            log_obj["agent_name"] = record.agent_name
+        if hasattr(record, "task_id"):
+            log_obj["task_id"] = record.task_id
+        if hasattr(record, "project_id"):
+            log_obj["project_id"] = record.project_id
+        if hasattr(record, "action"):
+            log_obj["action"] = record.action
+        if hasattr(record, "duration_ms"):
+            log_obj["duration_ms"] = record.duration_ms
+        if hasattr(record, "extra"):
+            log_obj.update(record.extra)
+        
+        # 添加异常信息
+        if record.exc_info:
+            log_obj["exception"] = self.formatException(record.exc_info)
+        
+        return json.dumps(log_obj, ensure_ascii=False)
+
+# 配置日志
+logger = logging.getLogger("task_service")
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+
+# 控制台处理器
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JSONFormatter())
+logger.handlers = [handler]
+
+# 禁用默认的 uvicorn 日志传播（保持 JSON 格式纯净）
+logging.getLogger("uvicorn").handlers = [handler]
+logging.getLogger("uvicorn.access").handlers = [handler]
+
+app = FastAPI(title="Task Management Service", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,6 +85,62 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 RATE_LIMIT_WINDOW = 60  # 1 minute
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "100"))
 rate_limit_store = {}  # Simple in-memory store
+
+# Idempotency
+IDEMPOTENCY_KEY_TTL = 86400  # 24 hours
+idempotency_store = {}  # key -> (response, timestamp)
+
+
+async def check_idempotency(idempotency_key: Optional[str] = None):
+    """检查幂等性
+    
+    如果提供了幂等键且已存在，返回缓存的响应。
+    否则返回 None，表示需要执行操作。
+    
+    Args:
+        idempotency_key: 幂等键（通常由客户端生成 UUID）
+    
+    Returns:
+        tuple: (cached_response, should_skip)
+    """
+    if not idempotency_key:
+        return None, False
+    
+    current_time = datetime.now().timestamp()
+    
+    # 清理过期的幂等键
+    expired_keys = [
+        k for k, (resp, ts) in idempotency_store.items()
+        if current_time - ts > IDEMPOTENCY_KEY_TTL
+    ]
+    for k in expired_keys:
+        del idempotency_store[k]
+    
+    # 检查幂等键是否存在
+    if idempotency_key in idempotency_store:
+        cached_response, _ = idempotency_store[idempotency_key]
+        logger.info(
+            f"Idempotency hit for key: {idempotency_key}",
+            extra={"idempotency_key": idempotency_key, "action": "idempotency_hit"}
+        )
+        return cached_response, True
+    
+    return None, False
+
+
+def store_idempotency_response(idempotency_key: Optional[str], response: dict):
+    """存储幂等响应
+    
+    Args:
+        idempotency_key: 幂等键
+        response: 响应数据
+    """
+    if idempotency_key:
+        idempotency_store[idempotency_key] = (response, datetime.now().timestamp())
+        logger.debug(
+            f"Stored idempotency response for key: {idempotency_key}",
+            extra={"idempotency_key": idempotency_key, "action": "idempotency_store"}
+        )
 
 
 async def get_db():
@@ -137,6 +240,7 @@ class TaskCreate(BaseModel):
     dependencies: Optional[List[int]] = None
     task_tags: Optional[List[str]] = None
     estimated_hours: Optional[float] = None
+    timeout_minutes: Optional[int] = None  # 任务超时（分钟），NULL 使用默认值
     created_by: Optional[str] = None
     due_at: Optional[str] = None
 
@@ -392,19 +496,25 @@ async def create_task(task: TaskCreate, db=Depends(get_db)):
             INSERT INTO tasks (
                 project_id, title, description, task_type, priority,
                 assignee_agent, reviewer_id, reviewer_mention, acceptance_criteria,
-                parent_task_id, dependencies, task_tags, estimated_hours, created_by, due_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                parent_task_id, dependencies, task_tags, estimated_hours, timeout_minutes, created_by, due_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             RETURNING *
             """,
             task.project_id, task.title, task.description, task.task_type, task.priority,
             task.assignee_agent, task.reviewer_id, task.reviewer_mention, task.acceptance_criteria,
             task.parent_task_id, task.dependencies, task.task_tags, task.estimated_hours,
-            task.created_by, task.due_at
+            task.timeout_minutes, task.created_by, task.due_at
         )
         
-        await conn.execute(
-            "INSERT INTO task_logs (task_id, action, message, actor) VALUES ($1, $2, $3, $4)",
-            result["id"], "created", f"Task created: {task.title}", task.created_by or "system"
+        logger.info(
+            f"Task created: {task.title} (ID: {result['id']})",
+            extra={
+                "task_id": result["id"],
+                "project_id": task.project_id,
+                "task_type": task.task_type,
+                "action": "task_created",
+                "created_by": task.created_by or "system"
+            }
         )
     return result
 
@@ -572,11 +682,23 @@ async def get_available_tasks_for_agent(
 
 
 @app.post("/tasks/{task_id}/claim", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
-async def claim_task(task_id: int, agent_name: str, db=Depends(get_db)):
-    """Agent 认领任务（带依赖检查和原子性乐观锁）
+async def claim_task(
+    task_id: int, 
+    agent_name: str, 
+    idempotency_key: Optional[str] = None,
+    db=Depends(get_db)
+):
+    """Agent 认领任务（带依赖检查、原子性乐观锁和幂等性）
     
     支持多任务模式，但限制最大并发任务数（默认 3 个）。
+    
+    幂等性：提供相同的 idempotency_key 会返回相同的结果，不会重复认领。
     """
+    # 检查幂等性
+    cached, should_skip = await check_idempotency(idempotency_key)
+    if should_skip:
+        return cached
+    
     # 最大并发任务数配置
     MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS_PER_AGENT", "3"))
     
@@ -636,6 +758,20 @@ async def claim_task(task_id: int, agent_name: str, db=Depends(get_db)):
             """,
             task_id, "claimed", "pending", "assigned", f"Task claimed by {agent_name}", agent_name
         )
+        
+        logger.info(
+            f"Task {task_id} claimed by {agent_name}",
+            extra={
+                "task_id": task_id,
+                "agent_name": agent_name,
+                "action": "task_claimed",
+                "idempotency_key": idempotency_key
+            }
+        )
+    
+    # 存储幂等响应
+    response = dict(result)
+    store_idempotency_response(idempotency_key, response)
     
     return result
 
@@ -692,8 +828,22 @@ async def start_task(task_id: int, agent_name: str, db=Depends(get_db)):
 
 
 @app.post("/tasks/{task_id}/submit", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
-async def submit_task(task_id: int, agent_name: str, result: dict, db=Depends(get_db)):
-    """Agent 提交任务完成，进入验收阶段"""
+async def submit_task(
+    task_id: int, 
+    agent_name: str, 
+    result: dict, 
+    idempotency_key: Optional[str] = None,
+    db=Depends(get_db)
+):
+    """Agent 提交任务完成，进入验收阶段
+    
+    幂等性：提供相同的 idempotency_key 会返回相同的结果，不会重复提交。
+    """
+    # 检查幂等性
+    cached, should_skip = await check_idempotency(idempotency_key)
+    if should_skip:
+        return cached
+    
     async with db.acquire() as conn:
         task = await conn.fetchrow(
             "SELECT * FROM tasks WHERE id = $1 AND assignee_agent = $2",
@@ -722,6 +872,20 @@ async def submit_task(task_id: int, agent_name: str, result: dict, db=Depends(ge
             """,
             task_id, "submitted", "running", "reviewing", f"Task submitted for review by {agent_name}", agent_name
         )
+        
+        logger.info(
+            f"Task {task_id} submitted by {agent_name}",
+            extra={
+                "task_id": task_id,
+                "agent_name": agent_name,
+                "action": "task_submitted",
+                "idempotency_key": idempotency_key
+            }
+        )
+    
+    # 存储幂等响应
+    response = dict(updated)
+    store_idempotency_response(idempotency_key, response)
     
     return updated
 
@@ -1222,11 +1386,18 @@ async def heartbeat_monitor():
 
 
 async def stuck_task_monitor():
-    """监控卡住的任务（running 超过2小时），自动释放
+    """监控卡住的任务，自动释放
+    
+    支持配置化超时时间：
+    - 任务级别的 timeout_minutes
+    - 任务类型默认配置（task_type_defaults 表）
+    - 全局默认 120 分钟
     
     使用全局连接池，避免每次循环创建新连接池的开销和潜在的连接泄露。
     """
     global pool
+    DEFAULT_TIMEOUT_MINUTES = int(os.getenv("DEFAULT_TASK_TIMEOUT_MINUTES", "120"))
+    
     while True:
         await asyncio.sleep(600)  # 每10分钟检查一次
         try:
@@ -1235,17 +1406,42 @@ async def stuck_task_monitor():
                 pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
             
             async with pool.acquire() as conn:
-                # 找出卡住的任务
+                # 找出卡住的任务（使用配置化超时）
                 stuck = await conn.fetch(
                     """
-                    SELECT * FROM tasks 
-                    WHERE status = 'running' 
-                    AND started_at < NOW() - INTERVAL '2 hours'
-                    """
+                    SELECT 
+                        t.*,
+                        COALESCE(
+                            t.timeout_minutes,
+                            ttd.timeout_minutes,
+                            $1
+                        ) as effective_timeout_minutes
+                    FROM tasks t
+                    LEFT JOIN task_type_defaults ttd ON t.task_type = ttd.task_type
+                    WHERE t.status = 'running'
+                    AND t.started_at < NOW() - (
+                        COALESCE(
+                            t.timeout_minutes,
+                            ttd.timeout_minutes,
+                            $1
+                        ) || ' minutes'
+                    )::INTERVAL
+                    """,
+                    DEFAULT_TIMEOUT_MINUTES
                 )
                 
                 for task in stuck:
-                    print(f"[Monitor] Releasing stuck task: {task['id']} - {task['title']}")
+                    timeout = task['effective_timeout_minutes']
+                    logger.warning(
+                        f"Task {task['id']} timed out after {timeout} minutes",
+                        extra={
+                            "task_id": task["id"],
+                            "task_title": task["title"],
+                            "agent_name": task["assignee_agent"],
+                            "timeout_minutes": timeout,
+                            "action": "auto_release_timeout"
+                        }
+                    )
                     
                     # 释放任务
                     await conn.execute(
@@ -1260,14 +1456,7 @@ async def stuck_task_monitor():
                     
                     # 更新 Agent 状态
                     if task["assignee_agent"]:
-                        await conn.execute(
-                            """
-                            UPDATE agents 
-                            SET status = 'online', current_task_id = NULL, updated_at = NOW()
-                            WHERE name = $1
-                            """,
-                            task["assignee_agent"]
-                        )
+                        await update_agent_status_after_task_change(conn, task["assignee_agent"])
                     
                     # 记录日志
                     await conn.execute(
@@ -1276,10 +1465,14 @@ async def stuck_task_monitor():
                         VALUES ($1, $2, $3, $4, $5, $6)
                         """,
                         task["id"], "auto_released", "running", "pending",
-                        "Task auto-released due to timeout (2 hours)", "system"
+                        f"Task auto-released due to timeout ({timeout} minutes)", "system"
                     )
         except Exception as e:
-            print(f"Stuck task monitor error: {e}")
+            logger.error(
+                "Stuck task monitor error",
+                exc_info=True,
+                extra={"action": "stuck_task_monitor_error"}
+            )
             # 出错时重置连接池，下次循环会重新创建
             pool = None
 
