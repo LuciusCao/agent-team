@@ -8,12 +8,10 @@ import logging
 from datetime import datetime
 
 import asyncpg
-from database import get_pool, reset_pool, DB_URL
+from database import get_pool, reset_pool
 from utils import update_agent_status_after_task_change
 
 logger = logging.getLogger("task_service")
-
-_pool_lock = asyncio.Lock()
 
 
 async def heartbeat_monitor():

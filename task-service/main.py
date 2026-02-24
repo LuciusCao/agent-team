@@ -5,7 +5,6 @@ Task Management Service - Main Application
 import os
 import asyncio
 import logging
-import sys
 import time
 from datetime import datetime
 from typing import Optional
@@ -14,22 +13,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from database import get_db
 from security import rate_limit
-from routers import projects, tasks, agents, dashboard, channels, channels_router
+from routers import projects, tasks, agents, dashboard, channels
 
 # Import utilities
-from utils import JSONFormatter
+from utils import setup_logging
 
 # ============ Structured Logging ============
 
-logger = logging.getLogger("task_service")
-logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
-
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(JSONFormatter())
-logger.handlers = [handler]
-
-logging.getLogger("uvicorn").handlers = [handler]
-logging.getLogger("uvicorn.access").handlers = [handler]
+setup_logging()
 
 # ============ FastAPI App ============
 
@@ -128,12 +119,12 @@ async def health_check(db=Depends(get_db)):
 
 # ============ Include Routers ============
 
-app.include_router(projects, prefix="/projects", tags=["projects"])
-app.include_router(tasks, prefix="/tasks", tags=["tasks"])
-app.include_router(agents, prefix="/agents", tags=["agents"])
-app.include_router(dashboard, prefix="/dashboard", tags=["dashboard"])
-app.include_router(channels, prefix="/agent-channels", tags=["channels"])
-app.include_router(channels_router, prefix="/channels", tags=["channels"])
+app.include_router(projects.router, prefix="/projects", tags=["projects"])
+app.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
+app.include_router(agents.router, prefix="/agents", tags=["agents"])
+app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
+app.include_router(channels.router, prefix="/agent-channels", tags=["channels"])
+app.include_router(channels.channels_router, prefix="/channels", tags=["channels"])
 
 
 # ============ Background Tasks ============

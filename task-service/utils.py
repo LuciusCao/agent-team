@@ -15,7 +15,25 @@ import asyncpg
 logger = logging.getLogger("task_service")
 
 
-# ============ JSON Formatter ============
+# ============ Logging Setup ============
+
+def setup_logging():
+    """配置结构化日志
+    
+    设置根日志记录器和 uvicorn 的日志格式
+    """
+    logger = logging.getLogger("task_service")
+    logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+    
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JSONFormatter())
+    logger.handlers = [handler]
+    
+    # 配置 uvicorn 日志
+    logging.getLogger("uvicorn").handlers = [handler]
+    logging.getLogger("uvicorn.access").handlers = [handler]
+    
+    return logger
 
 class JSONFormatter(logging.Formatter):
     """JSON 格式日志格式化器"""
