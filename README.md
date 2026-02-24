@@ -16,6 +16,8 @@
 - ✅ **进度监控** - 实时查看项目完成百分比
 - ✅ **重试机制** - 失败任务自动重试，超次数后标记失败
 - ✅ **卡住检测** - 运行超2小时任务自动释放
+- ✅ **多任务模式** - Agent 可认领多个任务，依次执行（默认最多3个）
+- ✅ **心跳机制** - Agent 定期发送心跳，自动检测离线
 
 ## 快速开始
 
@@ -124,9 +126,37 @@ agent-team/
 ### 核心理念
 
 - **Agent 主动认领**：不是被动分配，Worker 主动拉取适合的任务
+- **多任务模式**：一个 Agent 可以同时处理多个任务（默认最多 3 个，可配置）
 - **任务公开**：所有任务对所有 Agent 可见
 - **依赖检查**：前置任务未完成时不能认领
 - **验收机制**：Reviewer 验收，不合格打回重做
+
+### 多任务模式配置
+
+通过环境变量配置每个 Agent 的最大并发任务数：
+
+```bash
+# docker-compose.yml
+services:
+  task-service:
+    environment:
+      MAX_CONCURRENT_TASKS_PER_AGENT: 3  # 默认 3 个，设为 1 则单任务模式
+```
+
+当 Agent 达到最大并发数时，将无法认领新任务，直到完成或释放现有任务。
+
+### 任务执行限制
+
+- **认领**：可以认领多个任务（`assigned` 状态）
+- **执行**：同一时间只能执行一个任务（`running` 状态）
+- **验收**：可以提交多个任务等待验收（`reviewing` 状态）
+
+这意味着 Agent 可以：
+1. 认领任务 A、B、C（都是 assigned）
+2. 开始执行任务 A（A 变为 running，B、C 保持 assigned）
+3. 完成 A 后提交验收（A 变为 reviewing）
+4. 开始执行任务 B（B 变为 running）
+5. 以此类推...
 
 ### 任务状态流转
 
@@ -298,55 +328,50 @@ paths = ["./skills"]         # Skill 目录
 
 Worker Agent 使用任务系统的完整流程：
 
-#### 1. 注册 Agent
+#### 1. 注册 Agent 并启动心跳
 
-Agent 启动时向 Task Service 注册：
+Agent 启动时必须向 Task Service 注册并启动心跳：
 
 ```python
-import requests
-import os
+from skills.agent_manager import register_to_channel, start_heartbeat_loop, update_current_task
 
-TASK_SERVICE_URL = os.getenv("TASK_SERVICE_URL", "http://localhost:8080")
-AGENT_NAME = os.getenv("AGENT_NAME", "worker")
+# 1. 注册到 Task Service
+register_to_channel(channel_id="123456", channel_name="#ai项目")
 
-def register_agent():
-    """注册 Agent 到任务系统"""
-    resp = requests.post(
-        f"{TASK_SERVICE_URL}/agents/register",
-        json={
-            "name": AGENT_NAME,
-            "role": "research",  # 或 copywrite, video 等
-            "skills": ["research", "analysis", "writing"],  # 技能标签
-            "capabilities": {"languages": ["zh", "en"]}
-        }
-    )
-    return resp.json()
-
-# 在 Agent 启动时调用
-register_agent()
+# 2. 启动心跳循环（每 30 秒发送一次）
+start_heartbeat_loop(interval_seconds=30)
 ```
 
-#### 2. 发送心跳
+**注意**：心跳是必须的！如果 5 分钟没有心跳，Agent 会被标记为 offline。
 
-定期发送心跳保持在线状态：
+#### 2. 多任务模式工作流程
+
+Agent 可以认领多个任务，但同一时间只能执行一个：
 
 ```python
-def send_heartbeat():
-    """发送心跳"""
-    requests.post(
-        f"{TASK_SERVICE_URL}/agents/{AGENT_NAME}/heartbeat",
-        json={"current_task_id": current_task_id}  # 可选，当前执行的任务
-    )
-
-# 每 30 秒发送一次心跳
-import threading
-def heartbeat_loop():
-    while True:
-        send_heartbeat()
-        time.sleep(30)
-
-t = threading.Thread(target=heartbeat_loop, daemon=True)
-t.start()
+def multi_task_workflow():
+    """多任务模式工作流示例"""
+    
+    # 1. 认领多个任务（最多 MAX_CONCURRENT_TASKS 个）
+    task_a = claim_task(task_id=1)  # assigned
+    task_b = claim_task(task_id=2)  # assigned
+    task_c = claim_task(task_id=3)  # assigned
+    
+    # 2. 开始执行第一个任务
+    start_task(task_id=1)           # A: running, B/C: assigned
+    update_current_task(task_id=1)  # 更新心跳中的任务ID
+    execute_task(task_a)
+    submit_task(task_id=1)          # A: reviewing, B/C: assigned
+    update_current_task(task_id=None)
+    
+    # 3. 开始执行第二个任务
+    start_task(task_id=2)           # A: reviewing, B: running, C: assigned
+    update_current_task(task_id=2)
+    execute_task(task_b)
+    submit_task(task_id=2)          # A/B: reviewing, C: assigned
+    update_current_task(task_id=None)
+    
+    # 4. 继续执行第三个任务...
 ```
 
 #### 3. 查找并认领任务
@@ -378,6 +403,9 @@ def find_and_claim_task():
     if resp.status_code == 200:
         print(f"✅ 认领任务 #{task_id}: {task['title']}")
         return resp.json()
+    elif resp.status_code == 429:
+        print(f"⏳ 已达最大并发任务数限制")
+        return None
     else:
         print(f"❌ 认领失败: {resp.text}")
         return None
