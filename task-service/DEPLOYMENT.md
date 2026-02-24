@@ -13,6 +13,8 @@ docker-compose up -d
 
 访问 http://localhost:8080/docs 查看 API 文档。
 
+访问 http://localhost:8080/health 查看健康检查。
+
 ## 部署场景
 
 ### 场景1: 单机开发（所有 Agent 在同一台机器）
@@ -156,6 +158,18 @@ spec:
             secretKeyRef:
               name: db-secret
               key: url
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
 ---
 apiVersion: v1
 kind: Service
@@ -168,6 +182,28 @@ spec:
   - port: 80
     targetPort: 8080
   type: LoadBalancer
+```
+
+## 环境变量配置
+
+| 变量名 | 说明 | 默认值 | 生产环境建议 |
+|--------|------|--------|--------------|
+| `DATABASE_URL` | PostgreSQL 连接字符串 | `postgresql://localhost:5432/taskmanager` | 使用强密码 |
+| `API_KEY` | API 认证密钥 | 无（不认证） | **必须设置** |
+| `CORS_ORIGINS` | 允许的 CORS 来源 | `*`（允许所有） | 设置为具体域名 |
+| `LOG_LEVEL` | 日志级别 | `INFO` | `WARNING` |
+| `MAX_CONCURRENT_TASKS_PER_AGENT` | Agent 最大并发任务数 | `3` | 根据资源调整 |
+| `RATE_LIMIT_MAX_REQUESTS` | 每 IP 每分钟最大请求数 | `100` | 根据负载调整 |
+| `DEFAULT_TASK_TIMEOUT_MINUTES` | 默认任务超时时间 | `120` | 根据任务类型调整 |
+
+### CORS 配置示例
+
+```bash
+# 开发环境（允许所有来源）
+CORS_ORIGINS=*
+
+# 生产环境（限制具体域名）
+CORS_ORIGINS=https://app.your-domain.com,https://admin.your-domain.com
 ```
 
 ## 安全配置
@@ -187,47 +223,76 @@ services:
     #   - "5432:5432"  # 生产环境不要暴露
 ```
 
-### 2. API 认证（可选）
+### 2. API 认证（生产环境必须）
 
-如需添加 API Key 认证，可在 `app.py` 中添加：
+API Key 认证已内置，通过环境变量启用：
 
-```python
-from fastapi import Security, HTTPException
-from fastapi.security import APIKeyHeader
+```bash
+# 生成强密码
+openssl rand -base64 32
 
-API_KEY = os.getenv("API_KEY")
-api_key_header = APIKeyHeader(name="X-API-Key")
+# 设置环境变量
+export API_KEY=your-generated-api-key
+```
 
-async def verify_api_key(api_key: str = Security(api_key_header)):
-    if api_key != API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API Key")
-    return api_key
-
-# 保护敏感端点
-@app.post("/tasks", dependencies=[Depends(verify_api_key)])
-async def create_task(...):
-    ...
+在请求头中添加认证：
+```bash
+curl -H "X-API-Key: your-generated-api-key" http://localhost:8080/tasks
 ```
 
 ### 3. 速率限制
 
+内置内存速率限制（基于 IP）：
+
 ```python
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+# 可通过环境变量配置
+RATE_LIMIT_MAX_REQUESTS=100  # 每 IP 每分钟最大请求数
+```
 
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
+生产环境建议使用 Redis 实现分布式限流：
 
-@app.post("/tasks/{task_id}/claim")
-@limiter.limit("10/minute")
-async def claim_task(...):
-    ...
+```python
+# 需要额外安装和配置 Redis
+# 详见 utils.py 中的 RateLimiter 类
 ```
 
 ## 监控与日志
 
-### 1. 日志收集
+### 1. 健康检查
 
+```bash
+# 基础健康检查
+curl http://localhost:8080/
+# {"status": "ok", "service": "task-management", "version": "1.2.0"}
+
+# 详细健康检查
+curl http://localhost:8080/health
+# {
+#   "status": "healthy",
+#   "version": "1.2.0",
+#   "timestamp": "2026-02-24T14:30:00Z",
+#   "database": "connected",
+#   "uptime_seconds": 3600
+# }
+```
+
+### 2. 结构化日志
+
+服务使用 JSON 格式日志，便于日志收集和分析：
+
+```json
+{
+  "timestamp": "2026-02-24T14:30:00Z",
+  "level": "INFO",
+  "logger": "task_service",
+  "message": "Task 123 claimed by agent-1",
+  "task_id": 123,
+  "agent_name": "agent-1",
+  "action": "task_claimed"
+}
+```
+
+日志收集配置：
 ```yaml
 # docker-compose.yml
 services:
@@ -241,22 +306,46 @@ services:
         env: "OS_VERSION"
 ```
 
-### 2. 健康检查
+### 3. 请求日志
 
-```bash
-# 检查服务状态
-curl http://localhost:8080/
-
-# 预期响应
-{"status": "ok", "service": "task-management", "version": "1.1.0"}
+所有 HTTP 请求自动记录：
+```json
+{
+  "timestamp": "2026-02-24T14:30:00Z",
+  "level": "INFO",
+  "method": "POST",
+  "path": "/tasks/123/claim",
+  "status_code": 200,
+  "duration_ms": 45.2,
+  "client_ip": "192.168.1.100",
+  "action": "http_request"
+}
 ```
 
-### 3. 仪表盘
+### 4. 仪表盘
 
 访问 `/dashboard/stats` 查看实时统计：
 
 ```bash
 curl http://localhost:8080/dashboard/stats | jq
+```
+
+响应示例：
+```json
+{
+  "projects": {"total": 5, "active": 3},
+  "tasks": {
+    "total": 50,
+    "pending": 10,
+    "assigned": 5,
+    "running": 3,
+    "reviewing": 2,
+    "completed": 28,
+    "failed": 1,
+    "rejected": 1
+  },
+  "agents": {"total": 5, "online": 4, "offline": 0, "busy": 3}
+}
 ```
 
 ## 备份与恢复
@@ -304,22 +393,27 @@ crontab -e
    docker ps | grep task-service
    ```
 
-2. 检查端口监听
+2. 检查健康状态
+   ```bash
+   curl http://<task-service-ip>:8080/health
+   ```
+
+3. 检查端口监听
    ```bash
    netstat -tlnp | grep 8080  # Linux
    lsof -i :8080              # macOS
    ```
 
-3. 检查防火墙
+4. 检查防火墙
    ```bash
    # 测试连接
    curl http://<task-service-ip>:8080/
    ```
 
-4. 检查 Agent 配置
+5. 检查 Agent 配置
    ```bash
    # 在 Agent 容器中测试
-   docker exec <agent-container> curl http://<task-service-ip>:8080/
+   docker exec <agent-container> curl http://<task-service-ip>:8080/health
    ```
 
 ### 问题2: 数据库连接失败
@@ -330,6 +424,9 @@ docker logs taskmanager-db
 
 # 检查连接
 psql postgresql://taskmanager:taskmanager@localhost:5432/taskmanager -c "SELECT 1"
+
+# 检查连接池状态（在日志中查看）
+docker logs task-service | grep -i "db_retry\|connection"
 ```
 
 ### 问题3: Agent 显示为 offline
@@ -337,6 +434,19 @@ psql postgresql://taskmanager:taskmanager@localhost:5432/taskmanager -c "SELECT 
 - 检查 Agent 心跳是否正常发送
 - 检查 `TASK_SERVICE_URL` 配置是否正确
 - 检查网络连接是否稳定
+- 查看 Task Service 日志中的心跳记录
+
+### 问题4: 幂等性失效
+
+幂等键现在持久化到数据库，服务重启后仍然有效：
+
+```sql
+-- 查看幂等键
+SELECT * FROM idempotency_keys ORDER BY created_at DESC LIMIT 10;
+
+-- 清理过期幂等键（自动清理，也可手动执行）
+DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '24 hours';
+```
 
 ## 性能优化
 
@@ -346,17 +456,15 @@ psql postgresql://taskmanager:taskmanager@localhost:5432/taskmanager -c "SELECT 
 -- 添加索引（如果还没有）
 CREATE INDEX CONCURRENTLY idx_tasks_status_assignee ON tasks(status, assignee_agent);
 CREATE INDEX CONCURRENTLY idx_agents_status ON agents(status) WHERE status = 'online';
+CREATE INDEX CONCURRENTLY idx_idempotency_keys_created_at ON idempotency_keys(created_at);
 ```
 
 ### 2. 连接池配置
 
 ```python
-# app.py 中调整连接池大小
-pool = await asyncpg.create_pool(
-    DB_URL,
-    min_size=5,      # 最小连接数
-    max_size=20      # 最大连接数
-)
+# 通过环境变量或修改 app.py
+# 当前配置（可根据负载调整）：
+# min_size=2, max_size=10
 ```
 
 ### 3. 缓存（可选）
@@ -384,11 +492,20 @@ async def get_dashboard_stats():
 
 ## 升级指南
 
-### v1.0 → v1.1
+### v1.1 → v1.2
+
+**主要变更：**
+- 新增 `/health` 健康检查端点
+- 幂等键持久化到数据库
+- 添加数据库连接重试机制
+- CORS 来源可配置
+- 结构化日志改进
+
+**升级步骤：**
 
 ```bash
 # 1. 备份数据
-docker exec taskmanager-db pg_dump -U taskmanager taskmanager > v1.0_backup.sql
+docker exec taskmanager-db pg_dump -U taskmanager taskmanager > v1.1_backup.sql
 
 # 2. 拉取新代码
 git pull origin main
@@ -398,11 +515,28 @@ docker-compose down
 docker-compose up -d
 
 # 4. 验证
-curl http://localhost:8080/
+ curl http://localhost:8080/health
 ```
+
+## API 变更日志
+
+### v1.2.0
+
+**新增端点：**
+- `GET /health` - 详细健康检查
+
+**改进：**
+- 幂等性键持久化到数据库
+- 数据库连接自动重试
+- 请求日志中间件
+- CORS 来源可配置
+
+**废弃：**
+- 内存中的幂等性存储（已迁移到数据库）
 
 ## 参考
 
 - [FastAPI 文档](https://fastapi.tiangolo.com/)
 - [asyncpg 文档](https://magicstack.github.io/asyncpg/)
 - [PostgreSQL 文档](https://www.postgresql.org/docs/)
+- [项目 README](../README.md)
