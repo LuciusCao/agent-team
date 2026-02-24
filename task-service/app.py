@@ -10,8 +10,10 @@ import json
 import asyncio
 import logging
 import sys
+import time
 from datetime import datetime, timedelta
 from typing import Optional, List
+from functools import wraps
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Depends, Query, Security, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,17 +67,76 @@ logging.getLogger("uvicorn.access").handlers = [handler]
 
 app = FastAPI(title="Task Management Service", version="1.2.0")
 
+# CORS 配置 - 生产环境应该限制具体域名
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
+if CORS_ORIGINS == "*":
+    logger.warning("CORS is configured to allow all origins. This is insecure for production.")
+    allow_origins = ["*"]
+else:
+    allow_origins = [origin.strip() for origin in CORS_ORIGINS.split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=allow_origins,
+    allow_credentials=CORS_ORIGINS != "*",  # 允许所有来源时不能同时允许 credentials
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
 
+
+# ============ Request Logging Middleware ============
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """请求日志中间件
+    
+    记录每个请求的方法、路径、状态码和处理时间。
+    """
+    start_time = time.time()
+    
+    # 获取客户端 IP
+    client_ip = request.client.host if request.client else "unknown"
+    
+    try:
+        response = await call_next(request)
+        duration_ms = (time.time() - start_time) * 1000
+        
+        # 记录成功请求
+        logger.info(
+            f"{request.method} {request.url.path} - {response.status_code} - {duration_ms:.2f}ms",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": round(duration_ms, 2),
+                "client_ip": client_ip,
+                "action": "http_request"
+            }
+        )
+        
+        return response
+    except Exception as e:
+        duration_ms = (time.time() - start_time) * 1000
+        
+        # 记录异常请求
+        logger.error(
+            f"{request.method} {request.url.path} - ERROR - {duration_ms:.2f}ms - {e}",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "duration_ms": round(duration_ms, 2),
+                "client_ip": client_ip,
+                "error": str(e),
+                "action": "http_request_error"
+            },
+            exc_info=True
+        )
+        raise
+
 # Database
 DB_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/taskmanager")
-pool: Optional[asyncpg.Pool] = None
+_pool: Optional[asyncpg.Pool] = None
+_pool_lock = asyncio.Lock()
 
 # Security
 API_KEY = os.getenv("API_KEY")
@@ -88,16 +149,53 @@ rate_limit_store = {}  # Simple in-memory store
 
 # Idempotency
 IDEMPOTENCY_KEY_TTL = 86400  # 24 hours
-idempotency_store = {}  # key -> (response, timestamp)
 
 
-async def check_idempotency(idempotency_key: Optional[str] = None):
-    """检查幂等性
+# ============ Connection Retry Decorator ============
+
+def retry_on_db_error(max_retries=3, base_delay=1):
+    """数据库操作重试装饰器
+    
+    使用指数退避策略重试数据库操作。
+    
+    Args:
+        max_retries: 最大重试次数
+        base_delay: 基础延迟（秒）
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return await func(*args, **kwargs)
+                except (asyncpg.PostgresError, asyncpg.ConnectionDoesNotExistError, OSError) as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)  # 指数退避
+                        logger.warning(
+                            f"DB operation failed (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}",
+                            extra={"action": "db_retry", "attempt": attempt + 1, "delay": delay}
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(
+                            f"DB operation failed after {max_retries} attempts: {e}",
+                            extra={"action": "db_retry_exhausted", "max_retries": max_retries}
+                        )
+            raise last_exception
+        return wrapper
+    return decorator
+
+
+async def check_idempotency(conn: asyncpg.Connection, idempotency_key: Optional[str] = None):
+    """检查幂等性（数据库持久化版本）
     
     如果提供了幂等键且已存在，返回缓存的响应。
     否则返回 None，表示需要执行操作。
     
     Args:
+        conn: 数据库连接
         idempotency_key: 幂等键（通常由客户端生成 UUID）
     
     Returns:
@@ -106,19 +204,19 @@ async def check_idempotency(idempotency_key: Optional[str] = None):
     if not idempotency_key:
         return None, False
     
-    current_time = datetime.now().timestamp()
-    
-    # 清理过期的幂等键
-    expired_keys = [
-        k for k, (resp, ts) in idempotency_store.items()
-        if current_time - ts > IDEMPOTENCY_KEY_TTL
-    ]
-    for k in expired_keys:
-        del idempotency_store[k]
+    # 清理过期的幂等键（使用数据库）
+    await conn.execute(
+        "DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '24 hours'"
+    )
     
     # 检查幂等键是否存在
-    if idempotency_key in idempotency_store:
-        cached_response, _ = idempotency_store[idempotency_key]
+    row = await conn.fetchrow(
+        "SELECT response FROM idempotency_keys WHERE key = $1",
+        idempotency_key
+    )
+    
+    if row:
+        cached_response = json.loads(row['response'])
         logger.info(
             f"Idempotency hit for key: {idempotency_key}",
             extra={"idempotency_key": idempotency_key, "action": "idempotency_hit"}
@@ -128,7 +226,27 @@ async def check_idempotency(idempotency_key: Optional[str] = None):
     return None, False
 
 
-def store_idempotency_response(idempotency_key: Optional[str], response: dict):
+async def store_idempotency_response(conn: asyncpg.Connection, idempotency_key: Optional[str], response: dict):
+    """存储幂等响应（数据库持久化版本）
+    
+    Args:
+        conn: 数据库连接
+        idempotency_key: 幂等键
+        response: 响应数据
+    """
+    if idempotency_key:
+        await conn.execute(
+            """
+            INSERT INTO idempotency_keys (key, response, created_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (key) DO NOTHING
+            """,
+            idempotency_key, json.dumps(response)
+        )
+        logger.debug(
+            f"Stored idempotency response for key: {idempotency_key}",
+            extra={"idempotency_key": idempotency_key, "action": "idempotency_store"}
+        )
     """存储幂等响应
     
     Args:
@@ -144,10 +262,52 @@ def store_idempotency_response(idempotency_key: Optional[str], response: dict):
 
 
 async def get_db():
-    global pool
-    if pool is None:
-        pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
-    return pool
+    global _pool
+    if _pool is None:
+        async with _pool_lock:
+            if _pool is None:  # 双重检查
+                _pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
+    return _pool
+
+
+# ============ Health Check ============
+
+class HealthStatus(BaseModel):
+    status: str
+    version: str
+    timestamp: str
+    database: str
+    uptime_seconds: Optional[float] = None
+
+
+_start_time = datetime.utcnow()
+
+
+@app.get("/health", response_model=HealthStatus)
+async def health_check(db=Depends(get_db)):
+    """详细健康检查端点
+    
+    检查服务状态和数据库连接。
+    """
+    try:
+        # 检查数据库连接
+        async with db.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        db_status = "connected"
+    except Exception as e:
+        logger.error(f"Health check failed: {e}", extra={"action": "health_check_failed"})
+        db_status = "disconnected"
+        raise HTTPException(status_code=503, detail=f"Database connection failed: {e}")
+    
+    uptime = (datetime.utcnow() - _start_time).total_seconds()
+    
+    return HealthStatus(
+        status="healthy",
+        version="1.2.0",
+        timestamp=datetime.utcnow().isoformat() + "Z",
+        database=db_status,
+        uptime_seconds=uptime
+    )
 
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
@@ -364,7 +524,7 @@ async def update_agent_status_after_task_change(conn: asyncpg.Connection, agent_
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "task-management", "version": "1.1.0"}
+    return {"status": "ok", "service": "task-management", "version": "1.2.0"}
 
 
 # ============ Project Endpoints ============
@@ -654,15 +814,15 @@ async def claim_task(
     
     幂等性：提供相同的 idempotency_key 会返回相同的结果，不会重复认领。
     """
-    # 检查幂等性
-    cached, should_skip = await check_idempotency(idempotency_key)
-    if should_skip:
-        return cached
-    
     # 最大并发任务数配置
     MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS_PER_AGENT", "3"))
     
     async with db.acquire() as conn:
+        # 检查幂等性（在事务内检查）
+        cached, should_skip = await check_idempotency(conn, idempotency_key)
+        if should_skip:
+            return cached
+        
         # 检查依赖
         deps_ok, deps = await check_dependencies(conn, task_id)
         if not deps_ok:
@@ -728,10 +888,10 @@ async def claim_task(
                 "idempotency_key": idempotency_key
             }
         )
-    
-    # 存储幂等响应
-    response = dict(result)
-    store_idempotency_response(idempotency_key, response)
+        
+        # 存储幂等响应（在事务内）
+        response = dict(result)
+        await store_idempotency_response(conn, idempotency_key, response)
     
     return result
 
@@ -799,12 +959,12 @@ async def submit_task(
     
     幂等性：提供相同的 idempotency_key 会返回相同的结果，不会重复提交。
     """
-    # 检查幂等性
-    cached, should_skip = await check_idempotency(idempotency_key)
-    if should_skip:
-        return cached
-    
     async with db.acquire() as conn:
+        # 检查幂等性（在事务内）
+        cached, should_skip = await check_idempotency(conn, idempotency_key)
+        if should_skip:
+            return cached
+        
         task = await conn.fetchrow(
             "SELECT * FROM tasks WHERE id = $1 AND assignee_agent = $2",
             task_id, agent_name
@@ -842,10 +1002,10 @@ async def submit_task(
                 "idempotency_key": idempotency_key
             }
         )
-    
-    # 存储幂等响应
-    response = dict(updated)
-    store_idempotency_response(idempotency_key, response)
+        
+        # 存储幂等响应（在事务内）
+        response = dict(updated)
+        await store_idempotency_response(conn, idempotency_key, response)
     
     return updated
 
@@ -1322,15 +1482,17 @@ async def heartbeat_monitor():
     
     使用全局连接池，避免每次循环创建新连接池的开销和潜在的连接泄露。
     """
-    global pool
+    global _pool
     while True:
         await asyncio.sleep(60)
         try:
             # 确保连接池已初始化
-            if pool is None:
-                pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
+            if _pool is None:
+                async with _pool_lock:
+                    if _pool is None:
+                        _pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
             
-            async with pool.acquire() as conn:
+            async with _pool.acquire() as conn:
                 await conn.execute(
                     """
                     UPDATE agents 
@@ -1340,9 +1502,10 @@ async def heartbeat_monitor():
                     """
                 )
         except Exception as e:
-            print(f"Heartbeat monitor error: {e}")
+            logger.error(f"Heartbeat monitor error: {e}", exc_info=True)
             # 出错时重置连接池，下次循环会重新创建
-            pool = None
+            async with _pool_lock:
+                _pool = None
 
 
 async def stuck_task_monitor():
@@ -1355,17 +1518,19 @@ async def stuck_task_monitor():
     
     使用全局连接池，避免每次循环创建新连接池的开销和潜在的连接泄露。
     """
-    global pool
+    global _pool
     DEFAULT_TIMEOUT_MINUTES = int(os.getenv("DEFAULT_TASK_TIMEOUT_MINUTES", "120"))
     
     while True:
         await asyncio.sleep(600)  # 每10分钟检查一次
         try:
             # 确保连接池已初始化
-            if pool is None:
-                pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
+            if _pool is None:
+                async with _pool_lock:
+                    if _pool is None:
+                        _pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
             
-            async with pool.acquire() as conn:
+            async with _pool.acquire() as conn:
                 # 找出卡住的任务（使用配置化超时）
                 stuck = await conn.fetch(
                     """
@@ -1434,7 +1599,8 @@ async def stuck_task_monitor():
                 extra={"action": "stuck_task_monitor_error"}
             )
             # 出错时重置连接池，下次循环会重新创建
-            pool = None
+            async with _pool_lock:
+                _pool = None
 
 
 if __name__ == "__main__":

@@ -239,8 +239,15 @@ BEGIN
     END IF;
 END $$;
 
--- 索引
-CREATE INDEX IF NOT EXISTS idx_agents_name ON agents(name);
+-- 幂等性键存储表
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key VARCHAR(255) PRIMARY KEY,
+    response JSONB NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- 幂等性键索引（用于快速清理过期数据）
+CREATE INDEX IF NOT EXISTS idx_idempotency_keys_created_at ON idempotency_keys(created_at);
 CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
 CREATE INDEX IF NOT EXISTS idx_agents_skills ON agents USING GIN(skills);
 CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);
