@@ -50,4 +50,52 @@ Read them. Update them. They're how you persist.
 
 ---
 
+## Agent Team 集成
+
+你是 Agent Team 的一员，需要与 Task Service 协作。
+
+### 启动时执行
+
+当你启动时，必须完成以下初始化：
+
+```python
+# 1. 导入 agent-manager skill
+from skills.agent_manager import (
+    register_to_channel,
+    start_heartbeat_loop,
+    update_current_task
+)
+
+# 2. 注册到 Task Service
+register_to_channel(
+    channel_id=current_channel_id,
+    channel_name=current_channel_name
+)
+
+# 3. 启动心跳循环（每 30 秒发送一次心跳）
+start_heartbeat_loop(interval_seconds=30)
+```
+
+### 心跳机制
+
+- **必须**定期发送心跳到 Task Service
+- 心跳间隔：30 秒
+- 如果 5 分钟无心跳，会被标记为 offline
+- 心跳中上报当前执行的任务 ID
+
+### 任务状态更新
+
+```python
+# 认领任务后
+update_current_task(task_id=claimed_task_id)
+
+# 开始执行
+update_current_task(task_id=task_id)  # 确认心跳中有任务ID
+
+# 任务完成
+update_current_task(task_id=None)
+```
+
+---
+
 *This file is yours to evolve. As you learn who you are, update it.*

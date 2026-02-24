@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: taskmanager-db
+    environment:
+      POSTGRES_USER: taskmanager
+      POSTGRES_PASSWORD: taskmanager
+      POSTGRES_DB: taskmanager
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskmanager"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  task-service:
+    build: .
+    container_name: task-service
+    environment:
+      DATABASE_URL: postgresql://taskmanager:taskmanager@postgres:5432/taskmanager
+      # 每个 Agent 最大并发任务数（多任务模式）
+      MAX_CONCURRENT_TASKS_PER_AGENT: ${MAX_CONCURRENT_TASKS_PER_AGENT:-3}
+      # API 认证（生产环境必须设置）
+      API_KEY: ${API_KEY:-}
+      # 速率限制：每 IP 每分钟最大请求数
+      RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-100}
+      # 日志级别：DEBUG, INFO, WARNING, ERROR
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # 默认任务超时（分钟）
+      DEFAULT_TASK_TIMEOUT_MINUTES: ${DEFAULT_TASK_TIMEOUT_MINUTES:-120}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
