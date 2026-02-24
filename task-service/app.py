@@ -167,8 +167,16 @@ rate_limit_store = {}  # Simple in-memory store - will be replaced by RateLimite
 IDEMPOTENCY_KEY_TTL = 86400  # 24 hours
 
 
-# ============ Health Check ============
+async def get_db():
+    """获取数据库连接池
 
+    使用双检锁确保连接池只被创建一次
+    """
+    global _pool
+    if _pool is None:
+        async with _pool_lock:
+            if _pool is None:
+                _pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
     return _pool
 
 
