@@ -111,12 +111,11 @@ agent-team/
 │   ├── app.py               # API 服务
 │   ├── schema.sql           # 数据库 Schema
 │   ├── docker-compose.yml
-│   └── skill/               # Task CLI Skill
+│   └── DEPLOYMENT.md        # 部署指南
 ├── skills/                  # Agent Skills
-│   ├── agent-register/      # Agent 注册
-│   ├── agent-unregister/    # Agent 注销
-│   ├── task-manager/        # 任务管理
-│   └── project-manager/     # 项目经理 (新)
+│   ├── agent-manager/       # Agent 管理（注册/移除/查询）
+│   ├── project-manager/     # 项目管理（创建/拆分/监控）
+│   └── task-manager/        # 任务管理（CRUD/验收/CLI）
 └── shared/                  # 共享文件夹
 ```
 
@@ -236,11 +235,11 @@ curl -X POST "http://localhost:8080/tasks/1/review?reviewer=coordinator" \
 - 监控项目进度
 - 生成进度报告
 
-### agent-register / agent-unregister
+### agent-manager
 Agent 生命周期管理：
-- 注册到任务系统
-- 上报心跳
-- 注销
+- 注册到频道
+- 从频道移除
+- 查询频道活跃 Agent
 
 ## 使用方法
 
