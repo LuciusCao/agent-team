@@ -3,7 +3,7 @@ Task Service 测试套件
 
 运行方式:
     pytest tests/ -v
-    pytest tests/ -v --cov=app
+    pytest tests/ -v --cov=main
 
 需要环境变量:
     TEST_DATABASE_URL=postgresql://test:test@localhost:5432/test_taskmanager
@@ -24,7 +24,7 @@ os.environ["DATABASE_URL"] = os.getenv(
 os.environ["API_KEY"] = "test-api-key"
 os.environ["LOG_LEVEL"] = "DEBUG"
 
-from app import app, get_db, _pool
+from main import app, get_db
 
 
 @pytest_asyncio.fixture(scope="session")

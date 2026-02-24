@@ -5,7 +5,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+COPY main.py .
+COPY database.py .
+COPY security.py .
+COPY models.py .
+COPY utils.py .
+COPY background.py .
+COPY routers/ ./routers/
 COPY skill/ ./skill/
 
 # 安装 task CLI 工具
@@ -16,4 +22,4 @@ RUN pip install --no-cache-dir requests && \
 ENV PATH="/app/skill:${PATH}"
 ENV TASK_SERVICE_URL=http://task-service:8080
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

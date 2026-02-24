@@ -110,7 +110,19 @@ agent-team/
 │   ├── copy-writer/
 │   └── video-master/
 ├── task-service/            # 任务服务 (FastAPI + PostgreSQL)
-│   ├── app.py               # API 服务
+│   ├── main.py              # 应用入口
+│   ├── database.py          # 数据库连接
+│   ├── security.py          # 认证和限流
+│   ├── models.py            # Pydantic 模型
+│   ├── utils.py             # 工具函数
+│   ├── background.py        # 后台任务
+│   ├── routers/             # API 路由
+│   │   ├── __init__.py
+│   │   ├── projects.py      # 项目 API
+│   │   ├── tasks.py         # 任务 API
+│   │   ├── agents.py        # Agent API
+│   │   ├── dashboard.py     # 仪表盘 API
+│   │   └── channels.py      # 频道 API
 │   ├── schema.sql           # 数据库 Schema
 │   ├── docker-compose.yml
 │   └── DEPLOYMENT.md        # 部署指南
