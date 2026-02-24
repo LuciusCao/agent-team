@@ -30,6 +30,10 @@ services:
       API_KEY: ${API_KEY:-}
       # 速率限制：每 IP 每分钟最大请求数
       RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-100}
+      # 日志级别：DEBUG, INFO, WARNING, ERROR
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # 默认任务超时（分钟）
+      DEFAULT_TASK_TIMEOUT_MINUTES: ${DEFAULT_TASK_TIMEOUT_MINUTES:-120}
     ports:
       - "8080:8080"
     depends_on:
