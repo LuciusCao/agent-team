@@ -24,7 +24,7 @@ os.environ["DATABASE_URL"] = os.getenv(
 os.environ["API_KEY"] = "test-api-key"
 os.environ["LOG_LEVEL"] = "DEBUG"
 
-from app import app, get_db, pool
+from app import app, get_db, _pool
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -84,6 +84,330 @@ async def client(test_db):
 async def auth_headers():
     """认证头"""
     return {"X-API-Key": "test-api-key"}
+
+
+class TestTaskLifecycle:
+    """任务完整生命周期测试"""
+    
+    async def test_full_task_lifecycle_success(self, client, auth_headers):
+        """测试完整任务流转：pending → assigned → running → reviewing → completed"""
+        # 1. 创建项目
+        project_resp = await client.post(
+            "/projects",
+            json={"name": "Lifecycle Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+        
+        # 2. 创建任务
+        task_resp = await client.post(
+            "/tasks",
+            json={
+                "project_id": project["id"],
+                "title": "Lifecycle Test Task",
+                "task_type": "research"
+            },
+            headers=auth_headers
+        )
+        task = task_resp.json()
+        assert task["status"] == "pending"
+        task_id = task["id"]
+        
+        # 3. 注册 Agent
+        await client.post(
+            "/agents/register",
+            json={"name": "lifecycle-agent", "role": "research"},
+            headers=auth_headers
+        )
+        
+        # 4. 认领任务 (pending → assigned)
+        claim_resp = await client.post(
+            f"/tasks/{task_id}/claim",
+            params={"agent_name": "lifecycle-agent"},
+            headers=auth_headers
+        )
+        assert claim_resp.status_code == 200
+        assert claim_resp.json()["status"] == "assigned"
+        
+        # 5. 开始任务 (assigned → running)
+        start_resp = await client.post(
+            f"/tasks/{task_id}/start",
+            params={"agent_name": "lifecycle-agent"},
+            headers=auth_headers
+        )
+        assert start_resp.status_code == 200
+        assert start_resp.json()["status"] == "running"
+        
+        # 6. 提交任务 (running → reviewing)
+        submit_resp = await client.post(
+            f"/tasks/{task_id}/submit",
+            params={"agent_name": "lifecycle-agent"},
+            json={"output": "test result", "summary": "Task completed successfully"},
+            headers=auth_headers
+        )
+        assert submit_resp.status_code == 200
+        assert submit_resp.json()["status"] == "reviewing"
+        
+        # 7. 验收通过 (reviewing → completed)
+        review_resp = await client.post(
+            f"/tasks/{task_id}/review",
+            params={"reviewer": "test-reviewer"},
+            json={"approved": True, "feedback": "Good job!"},
+            headers=auth_headers
+        )
+        assert review_resp.status_code == 200
+        assert review_resp.json()["status"] == "completed"
+        
+        # 8. 验证最终状态
+        task_detail = await client.get(f"/tasks/{task_id}")
+        assert task_detail.status_code == 200
+        final_task = task_detail.json()["task"]
+        assert final_task["status"] == "completed"
+        assert final_task["assignee_agent"] == "lifecycle-agent"
+        assert final_task["completed_at"] is not None
+    
+    async def test_task_lifecycle_rejected(self, client, auth_headers):
+        """测试任务被拒绝流程：pending → assigned → running → reviewing → rejected → pending"""
+        # 1. 创建项目和任务
+        project_resp = await client.post(
+            "/projects",
+            json={"name": "Reject Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+        
+        task_resp = await client.post(
+            "/tasks",
+            json={
+                "project_id": project["id"],
+                "title": "Reject Test Task",
+                "task_type": "research"
+            },
+            headers=auth_headers
+        )
+        task_id = task_resp.json()["id"]
+        
+        # 2. 注册 Agent
+        await client.post(
+            "/agents/register",
+            json={"name": "reject-agent", "role": "research"},
+            headers=auth_headers
+        )
+        
+        # 3. 认领、开始、提交任务
+        await client.post(f"/tasks/{task_id}/claim", params={"agent_name": "reject-agent"}, headers=auth_headers)
+        await client.post(f"/tasks/{task_id}/start", params={"agent_name": "reject-agent"}, headers=auth_headers)
+        await client.post(
+            f"/tasks/{task_id}/submit",
+            params={"agent_name": "reject-agent"},
+            json={"output": "incomplete work"},
+            headers=auth_headers
+        )
+        
+        # 4. 验收拒绝 (reviewing → rejected)
+        review_resp = await client.post(
+            f"/tasks/{task_id}/review",
+            params={"reviewer": "strict-reviewer"},
+            json={"approved": False, "feedback": "Need more details"},
+            headers=auth_headers
+        )
+        assert review_resp.status_code == 200
+        assert review_resp.json()["status"] == "rejected"
+        
+        # 5. 重试任务 (rejected → pending)
+        retry_resp = await client.post(
+            f"/tasks/{task_id}/retry",
+            headers=auth_headers
+        )
+        assert retry_resp.status_code == 200
+        assert retry_resp.json()["status"] == "pending"
+        assert retry_resp.json()["retry_count"] == 1
+    
+    async def test_cannot_start_without_claim(self, client, auth_headers):
+        """测试未认领不能开始任务"""
+        # 创建项目、任务、Agent
+        project_resp = await client.post("/projects", json={"name": "No Claim Project"}, headers=auth_headers)
+        task_resp = await client.post(
+            "/tasks",
+            json={"project_id": project_resp.json()["id"], "title": "No Claim Task", "task_type": "research"},
+            headers=auth_headers
+        )
+        task_id = task_resp.json()["id"]
+        
+        await client.post("/agents/register", json={"name": "no-claim-agent", "role": "research"}, headers=auth_headers)
+        
+        # 尝试直接开始未认领的任务
+        response = await client.post(
+            f"/tasks/{task_id}/start",
+            params={"agent_name": "no-claim-agent"},
+            headers=auth_headers
+        )
+        assert response.status_code == 404
+        assert "not assigned to you" in response.json()["detail"]
+    
+    async def test_cannot_submit_without_start(self, client, auth_headers):
+        """测试未开始不能提交任务"""
+        # 创建项目、任务、Agent
+        project_resp = await client.post("/projects", json={"name": "No Start Project"}, headers=auth_headers)
+        task_resp = await client.post(
+            "/tasks",
+            json={"project_id": project_resp.json()["id"], "title": "No Start Task", "task_type": "research"},
+            headers=auth_headers
+        )
+        task_id = task_resp.json()["id"]
+        
+        await client.post("/agents/register", json={"name": "no-start-agent", "role": "research"}, headers=auth_headers)
+        await client.post(f"/tasks/{task_id}/claim", params={"agent_name": "no-start-agent"}, headers=auth_headers)
+        
+        # 尝试提交未开始的任务
+        response = await client.post(
+            f"/tasks/{task_id}/submit",
+            params={"agent_name": "no-start-agent"},
+            json={"output": "result"},
+            headers=auth_headers
+        )
+        assert response.status_code == 400
+        assert "Cannot submit task with status: assigned" in response.json()["detail"]
+    
+    async def test_release_task(self, client, auth_headers):
+        """测试释放任务"""
+        # 创建项目、任务、Agent
+        project_resp = await client.post("/projects", json={"name": "Release Project"}, headers=auth_headers)
+        task_resp = await client.post(
+            "/tasks",
+            json={"project_id": project_resp.json()["id"], "title": "Release Task", "task_type": "research"},
+            headers=auth_headers
+        )
+        task_id = task_resp.json()["id"]
+        
+        await client.post("/agents/register", json={"name": "release-agent", "role": "research"}, headers=auth_headers)
+        
+        # 认领任务
+        await client.post(f"/tasks/{task_id}/claim", params={"agent_name": "release-agent"}, headers=auth_headers)
+        
+        # 释放任务
+        release_resp = await client.post(
+            f"/tasks/{task_id}/release",
+            params={"agent_name": "release-agent"},
+            headers=auth_headers
+        )
+        assert release_resp.status_code == 200
+        assert release_resp.json()["status"] == "pending"
+        assert release_resp.json()["assignee_agent"] is None
+
+
+class TestTaskDependencies:
+    """任务依赖测试"""
+    
+    async def test_cannot_claim_with_unfinished_deps(self, client, auth_headers):
+        """依赖未完成时不能认领"""
+        # 创建项目
+        project_resp = await client.post("/projects", json={"name": "Deps Project"}, headers=auth_headers)
+        project_id = project_resp.json()["id"]
+        
+        # 创建两个任务
+        task1_resp = await client.post(
+            "/tasks",
+            json={"project_id": project_id, "title": "Task 1", "task_type": "research"},
+            headers=auth_headers
+        )
+        task1_id = task1_resp.json()["id"]
+        
+        task2_resp = await client.post(
+            "/tasks",
+            json={"project_id": project_id, "title": "Task 2", "task_type": "research", "dependencies": [task1_id]},
+            headers=auth_headers
+        )
+        task2_id = task2_resp.json()["id"]
+        
+        # 注册 Agent
+        await client.post("/agents/register", json={"name": "deps-agent", "role": "research"}, headers=auth_headers)
+        
+        # 尝试认领有依赖的任务（应该失败）
+        response = await client.post(
+            f"/tasks/{task2_id}/claim",
+            params={"agent_name": "deps-agent"},
+            headers=auth_headers
+        )
+        assert response.status_code == 400
+        assert "Dependencies not completed" in response.json()["detail"]
+        
+        # 完成第一个任务
+        await client.post(f"/tasks/{task1_id}/claim", params={"agent_name": "deps-agent"}, headers=auth_headers)
+        await client.post(f"/tasks/{task1_id}/start", params={"agent_name": "deps-agent"}, headers=auth_headers)
+        await client.post(f"/tasks/{task1_id}/submit", params={"agent_name": "deps-agent"}, json={"output": "done"}, headers=auth_headers)
+        await client.post(f"/tasks/{task1_id}/review", params={"reviewer": "test"}, json={"approved": True}, headers=auth_headers)
+        
+        # 现在可以认领第二个任务
+        response = await client.post(
+            f"/tasks/{task2_id}/claim",
+            params={"agent_name": "deps-agent"},
+            headers=auth_headers
+        )
+        assert response.status_code == 200
+    
+    async def test_circular_dependencies_detection(self, client, auth_headers):
+        """测试循环依赖检测"""
+        project_resp = await client.post("/projects", json={"name": "Circular Project"}, headers=auth_headers)
+        project_id = project_resp.json()["id"]
+        
+        # 尝试创建循环依赖的任务
+        response = await client.post(
+            f"/projects/{project_id}/breakdown",
+            json=[
+                {"title": "Task A", "task_type": "research", "dependencies": [1]},  # 依赖 B
+                {"title": "Task B", "task_type": "research", "dependencies": [0]},  # 依赖 A（循环！）
+            ],
+            headers=auth_headers
+        )
+        assert response.status_code == 400
+        assert "Circular dependency detected" in response.json()["detail"]
+
+
+class TestConcurrency:
+    """并发测试"""
+    
+    async def test_claim_race_condition(self, client, auth_headers):
+        """测试认领竞态条件 - 只有一个 Agent 能成功"""
+        # 创建项目和一个任务
+        project_resp = await client.post("/projects", json={"name": "Race Project"}, headers=auth_headers)
+        task_resp = await client.post(
+            "/tasks",
+            json={"project_id": project_resp.json()["id"], "title": "Race Task", "task_type": "research"},
+            headers=auth_headers
+        )
+        task_id = task_resp.json()["id"]
+        
+        # 注册两个 Agent
+        await client.post("/agents/register", json={"name": "agent-a", "role": "research"}, headers=auth_headers)
+        await client.post("/agents/register", json={"name": "agent-b", "role": "research"}, headers=auth_headers)
+        
+        # 同时发送两个认领请求
+        import asyncio
+        
+        async def claim_agent_a():
+            return await client.post(
+                f"/tasks/{task_id}/claim",
+                params={"agent_name": "agent-a"},
+                headers=auth_headers
+            )
+        
+        async def claim_agent_b():
+            return await client.post(
+                f"/tasks/{task_id}/claim",
+                params={"agent_name": "agent-b"},
+                headers=auth_headers
+            )
+        
+        # 并发执行
+        results = await asyncio.gather(claim_agent_a(), claim_agent_b(), return_exceptions=True)
+        
+        # 一个成功，一个失败
+        success_count = sum(1 for r in results if hasattr(r, 'status_code') and r.status_code == 200)
+        conflict_count = sum(1 for r in results if hasattr(r, 'status_code') and r.status_code == 409)
+        
+        assert success_count == 1, f"Expected 1 success, got {success_count}"
+        assert conflict_count == 1, f"Expected 1 conflict, got {conflict_count}"
 
 
 class TestHealth:

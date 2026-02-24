@@ -13,12 +13,28 @@ import sys
 import time
 from datetime import datetime, timedelta
 from typing import Optional, List
-from functools import wraps
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Depends, Query, Security, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 import asyncpg
+
+# Import utilities
+from utils import (
+    retry_on_db_error,
+    check_idempotency,
+    store_idempotency_response,
+    check_dependencies,
+    validate_task_dependencies,
+    update_agent_status_after_task_change,
+    update_agent_stats_on_completion,
+    log_task_action,
+    log_structured,
+    RateLimiter,
+    validate_task_type,
+    validate_agent_role,
+    sanitize_string,
+)
 
 # ============ Structured Logging ============
 
@@ -145,128 +161,14 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 # Rate limiting
 RATE_LIMIT_WINDOW = 60  # 1 minute
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "100"))
-rate_limit_store = {}  # Simple in-memory store
+rate_limit_store = {}  # Simple in-memory store - will be replaced by RateLimiter class from utils
 
 # Idempotency
 IDEMPOTENCY_KEY_TTL = 86400  # 24 hours
 
 
-# ============ Connection Retry Decorator ============
+# ============ Health Check ============
 
-def retry_on_db_error(max_retries=3, base_delay=1):
-    """数据库操作重试装饰器
-    
-    使用指数退避策略重试数据库操作。
-    
-    Args:
-        max_retries: 最大重试次数
-        base_delay: 基础延迟（秒）
-    """
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            last_exception = None
-            for attempt in range(max_retries):
-                try:
-                    return await func(*args, **kwargs)
-                except (asyncpg.PostgresError, asyncpg.ConnectionDoesNotExistError, OSError) as e:
-                    last_exception = e
-                    if attempt < max_retries - 1:
-                        delay = base_delay * (2 ** attempt)  # 指数退避
-                        logger.warning(
-                            f"DB operation failed (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}",
-                            extra={"action": "db_retry", "attempt": attempt + 1, "delay": delay}
-                        )
-                        await asyncio.sleep(delay)
-                    else:
-                        logger.error(
-                            f"DB operation failed after {max_retries} attempts: {e}",
-                            extra={"action": "db_retry_exhausted", "max_retries": max_retries}
-                        )
-            raise last_exception
-        return wrapper
-    return decorator
-
-
-async def check_idempotency(conn: asyncpg.Connection, idempotency_key: Optional[str] = None):
-    """检查幂等性（数据库持久化版本）
-    
-    如果提供了幂等键且已存在，返回缓存的响应。
-    否则返回 None，表示需要执行操作。
-    
-    Args:
-        conn: 数据库连接
-        idempotency_key: 幂等键（通常由客户端生成 UUID）
-    
-    Returns:
-        tuple: (cached_response, should_skip)
-    """
-    if not idempotency_key:
-        return None, False
-    
-    # 清理过期的幂等键（使用数据库）
-    await conn.execute(
-        "DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '24 hours'"
-    )
-    
-    # 检查幂等键是否存在
-    row = await conn.fetchrow(
-        "SELECT response FROM idempotency_keys WHERE key = $1",
-        idempotency_key
-    )
-    
-    if row:
-        cached_response = json.loads(row['response'])
-        logger.info(
-            f"Idempotency hit for key: {idempotency_key}",
-            extra={"idempotency_key": idempotency_key, "action": "idempotency_hit"}
-        )
-        return cached_response, True
-    
-    return None, False
-
-
-async def store_idempotency_response(conn: asyncpg.Connection, idempotency_key: Optional[str], response: dict):
-    """存储幂等响应（数据库持久化版本）
-    
-    Args:
-        conn: 数据库连接
-        idempotency_key: 幂等键
-        response: 响应数据
-    """
-    if idempotency_key:
-        await conn.execute(
-            """
-            INSERT INTO idempotency_keys (key, response, created_at)
-            VALUES ($1, $2, NOW())
-            ON CONFLICT (key) DO NOTHING
-            """,
-            idempotency_key, json.dumps(response)
-        )
-        logger.debug(
-            f"Stored idempotency response for key: {idempotency_key}",
-            extra={"idempotency_key": idempotency_key, "action": "idempotency_store"}
-        )
-    """存储幂等响应
-    
-    Args:
-        idempotency_key: 幂等键
-        response: 响应数据
-    """
-    if idempotency_key:
-        idempotency_store[idempotency_key] = (response, datetime.now().timestamp())
-        logger.debug(
-            f"Stored idempotency response for key: {idempotency_key}",
-            extra={"idempotency_key": idempotency_key, "action": "idempotency_store"}
-        )
-
-
-async def get_db():
-    global _pool
-    if _pool is None:
-        async with _pool_lock:
-            if _pool is None:  # 双重检查
-                _pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
     return _pool
 
 
@@ -416,108 +318,6 @@ class TaskUpdate(BaseModel):
 class TaskReview(BaseModel):
     approved: bool
     feedback: Optional[str] = None
-
-
-# ============ Dependency Check ============
-
-async def check_dependencies(conn: asyncpg.Connection, task_id: int) -> tuple[bool, List[int]]:
-    """检查任务依赖是否完成"""
-    task = await conn.fetchrow("SELECT dependencies FROM tasks WHERE id = $1", task_id)
-    if not task or not task["dependencies"]:
-        return True, []
-    
-    deps = task["dependencies"]
-    
-    # 检查所有依赖任务是否完成
-    for dep_id in deps:
-        dep = await conn.fetchrow(
-            "SELECT status FROM tasks WHERE id = $1",
-            dep_id
-        )
-        if not dep or dep["status"] != "completed":
-            return False, deps
-    
-    return True, []
-
-
-
-def validate_task_dependencies(tasks: List[TaskCreate]) -> None:
-    """验证任务依赖关系，检测循环依赖"""
-    from collections import defaultdict, deque
-    
-    n = len(tasks)
-    graph = defaultdict(list)
-    in_degree = [0] * n
-    
-    for i, task in enumerate(tasks):
-        if task.dependencies:
-            for dep_idx in task.dependencies:
-                if dep_idx < 0 or dep_idx >= n:
-                    raise HTTPException(status_code=400, detail=f"Invalid dependency index: {dep_idx}")
-                if dep_idx == i:
-                    raise HTTPException(status_code=400, detail=f"Task cannot depend on itself")
-                graph[dep_idx].append(i)
-                in_degree[i] += 1
-    
-    queue = deque([i for i in range(n) if in_degree[i] == 0])
-    visited = 0
-    
-    while queue:
-        node = queue.popleft()
-        visited += 1
-        for neighbor in graph[node]:
-            in_degree[neighbor] -= 1
-            if in_degree[neighbor] == 0:
-                queue.append(neighbor)
-    
-    if visited != n:
-        raise HTTPException(status_code=400, detail="Circular dependency detected")
-
-# ============ Agent Status Helper ============
-
-async def update_agent_status_after_task_change(conn: asyncpg.Connection, agent_name: str):
-    """任务变更后更新 Agent 状态
-    
-    检查 Agent 是否还有其他进行中的任务：
-    - 如果没有，设为 online，current_task_id = NULL
-    - 如果有，设为 busy，current_task_id = 其中一个任务ID
-    
-    Args:
-        conn: 数据库连接
-        agent_name: Agent 名称
-    """
-    # 检查是否还有其他进行中的任务
-    other_tasks = await conn.fetchrow(
-        """
-        SELECT COUNT(*) as count, 
-               MIN(id) as next_task_id
-        FROM tasks 
-        WHERE assignee_agent = $1 
-        AND status IN ('assigned', 'running', 'reviewing')
-        """,
-        agent_name
-    )
-    
-    if other_tasks['count'] == 0:
-        # 没有其他任务了，设为 online
-        await conn.execute(
-            """
-            UPDATE agents 
-            SET status = 'online', current_task_id = NULL, updated_at = NOW()
-            WHERE name = $1
-            """,
-            agent_name
-        )
-    else:
-        # 还有其他任务，设为 busy，更新 current_task_id
-        await conn.execute(
-            """
-            UPDATE agents 
-            SET status = 'busy', current_task_id = $1, updated_at = NOW()
-            WHERE name = $2
-            """,
-            other_tasks['next_task_id'], agent_name
-        )
 
 
 # ============ API Routes ============
