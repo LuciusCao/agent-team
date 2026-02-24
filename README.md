@@ -236,11 +236,11 @@ curl -X POST "http://localhost:8080/tasks/1/review?reviewer=coordinator" \
 - 监控项目进度
 - 生成进度报告
 
-### agent-register / agent-unregister
+### agent-manager
 Agent 生命周期管理：
-- 注册到任务系统
-- 上报心跳
-- 注销
+- 注册到频道
+- 从频道移除
+- 查询频道活跃 Agent
 
 ## 使用方法
 
