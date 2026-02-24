@@ -6,12 +6,64 @@ import os
 import json
 import asyncio
 import logging
+import sys
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from functools import wraps
 import asyncpg
 
 logger = logging.getLogger("task_service")
+
+
+# ============ Logging Setup ============
+
+def setup_logging():
+    """配置结构化日志
+    
+    设置根日志记录器和 uvicorn 的日志格式
+    """
+    logger = logging.getLogger("task_service")
+    logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+    
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JSONFormatter())
+    logger.handlers = [handler]
+    
+    # 配置 uvicorn 日志
+    logging.getLogger("uvicorn").handlers = [handler]
+    logging.getLogger("uvicorn.access").handlers = [handler]
+    
+    return logger
+
+class JSONFormatter(logging.Formatter):
+    """JSON 格式日志格式化器"""
+    def format(self, record):
+        log_obj = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        
+        # 添加额外字段
+        if hasattr(record, "agent_name"):
+            log_obj["agent_name"] = record.agent_name
+        if hasattr(record, "task_id"):
+            log_obj["task_id"] = record.task_id
+        if hasattr(record, "project_id"):
+            log_obj["project_id"] = record.project_id
+        if hasattr(record, "action"):
+            log_obj["action"] = record.action
+        if hasattr(record, "duration_ms"):
+            log_obj["duration_ms"] = record.duration_ms
+        if hasattr(record, "extra"):
+            log_obj.update(record.extra)
+        
+        # 添加异常信息
+        if record.exc_info:
+            log_obj["exception"] = self.formatException(record.exc_info)
+        
+        return json.dumps(log_obj, ensure_ascii=False)
 
 
 # ============ Database Utilities ============
