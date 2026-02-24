@@ -369,20 +369,28 @@ async def get_available_tasks_for_agent(
 
 @app.post("/tasks/{task_id}/claim")
 async def claim_task(task_id: int, agent_name: str, db=Depends(get_db)):
-    """Agent 认领任务（带依赖检查和乐观锁）"""
+    """Agent 认领任务（带依赖检查和原子性乐观锁）"""
     async with db.acquire() as conn:
         # 检查依赖
         deps_ok, deps = await check_dependencies(conn, task_id)
         if not deps_ok:
             raise HTTPException(status_code=400, detail=f"Dependencies not completed: {deps}")
         
-        # 检查任务是否存在且可认领（乐观锁）
-        task = await conn.fetchrow(
-            "SELECT * FROM tasks WHERE id = $1 AND status = 'pending' AND assignee_agent IS NULL",
-            task_id
+        # 原子性认领：使用 UPDATE ... RETURNING 确保只有一个 Agent 能成功
+        # 这避免了 SELECT + UPDATE 之间的竞态条件
+        result = await conn.fetchrow(
+            """
+            UPDATE tasks 
+            SET assignee_agent = $1, status = 'assigned', assigned_at = NOW(), updated_at = NOW()
+            WHERE id = $2 AND status = 'pending' AND assignee_agent IS NULL
+            RETURNING *
+            """,
+            agent_name, task_id
         )
-        if not task:
-            raise HTTPException(status_code=404, detail="Task not available or already claimed")
+        
+        if not result:
+            # 任务已被其他 Agent 认领或状态已变更
+            raise HTTPException(status_code=409, detail="Task already claimed by another agent or not available")
         
         # 更新 Agent 状态
         await conn.execute(
@@ -392,17 +400,6 @@ async def claim_task(task_id: int, agent_name: str, db=Depends(get_db)):
             WHERE name = $2
             """,
             task_id, agent_name
-        )
-        
-        # 认领任务
-        result = await conn.fetchrow(
-            """
-            UPDATE tasks 
-            SET assignee_agent = $1, status = 'assigned', assigned_at = NOW(), updated_at = NOW()
-            WHERE id = $2
-            RETURNING *
-            """,
-            agent_name, task_id
         )
         
         # 记录日志
