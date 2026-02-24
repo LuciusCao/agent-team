@@ -639,46 +639,6 @@ async def get_available_tasks_for_agent(
             )
     
     return [dict(row) for row in results]
-    agent_name: str,
-    skill_match: bool = True,
-    db=Depends(get_db)
-):
-    """获取适合某 Agent 的任务（带技能匹配）"""
-    async with db.acquire() as conn:
-        # 获取 Agent 信息
-        agent = await conn.fetchrow("SELECT * FROM agents WHERE name = $1", agent_name)
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        
-        # 获取所有 pending 且未分配的任务
-        pending = await conn.fetch(
-            """
-            SELECT * FROM tasks 
-            WHERE status = 'pending' AND assignee_agent IS NULL
-            ORDER BY priority DESC, created_at ASC
-            """
-        )
-        
-        # 过滤：依赖完成 + 技能匹配（可选）
-        available = []
-        agent_skills = set(agent["skills"] or [])
-        
-        for task in pending:
-            # 检查依赖
-            deps_ok, _ = await check_dependencies(conn, task["id"])
-            if not deps_ok:
-                continue
-            
-            # 技能匹配
-            if skill_match and agent_skills:
-                task_tags = set(task["task_tags"] or [])
-                # 有共同标签才算匹配
-                if not (agent_skills & task_tags):
-                    continue
-            
-            available.append(dict(task))
-    
-    return available
 
 
 @app.post("/tasks/{task_id}/claim", dependencies=[Depends(verify_api_key), Depends(rate_limit)])

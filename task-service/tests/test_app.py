@@ -11,6 +11,7 @@ Task Service 测试套件
 
 import os
 import pytest
+import pytest_asyncio
 import asyncio
 from datetime import datetime, timedelta
 from httpx import AsyncClient, ASGITransport
@@ -26,15 +27,7 @@ os.environ["LOG_LEVEL"] = "DEBUG"
 from app import app, get_db, pool
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """创建事件循环"""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="session")
+@pytest_asyncio.fixture(scope="session")
 async def test_db():
     """创建测试数据库连接池"""
     import asyncpg
@@ -71,7 +64,7 @@ async def test_db():
     await test_pool.close()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def client(test_db):
     """创建测试客户端"""
     # 覆盖 get_db 使用测试连接池
@@ -87,7 +80,7 @@ async def client(test_db):
     app.dependency_overrides.clear()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def auth_headers():
     """认证头"""
     return {"X-API-Key": "test-api-key"}
