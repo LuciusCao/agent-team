@@ -955,11 +955,18 @@ async def startup_event():
 
 
 async def heartbeat_monitor():
-    """监控 Agent 心跳，超时设为 offline"""
+    """监控 Agent 心跳，超时设为 offline
+    
+    使用全局连接池，避免每次循环创建新连接池的开销和潜在的连接泄露。
+    """
+    global pool
     while True:
         await asyncio.sleep(60)
         try:
-            pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=1)
+            # 确保连接池已初始化
+            if pool is None:
+                pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
+            
             async with pool.acquire() as conn:
                 await conn.execute(
                     """
@@ -969,17 +976,25 @@ async def heartbeat_monitor():
                     AND last_heartbeat < NOW() - INTERVAL '5 minutes'
                     """
                 )
-            await pool.close()
         except Exception as e:
             print(f"Heartbeat monitor error: {e}")
+            # 出错时重置连接池，下次循环会重新创建
+            pool = None
 
 
 async def stuck_task_monitor():
-    """监控卡住的任务（running 超过2小时），自动释放"""
+    """监控卡住的任务（running 超过2小时），自动释放
+    
+    使用全局连接池，避免每次循环创建新连接池的开销和潜在的连接泄露。
+    """
+    global pool
     while True:
         await asyncio.sleep(600)  # 每10分钟检查一次
         try:
-            pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=1)
+            # 确保连接池已初始化
+            if pool is None:
+                pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
+            
             async with pool.acquire() as conn:
                 # 找出卡住的任务
                 stuck = await conn.fetch(
@@ -1024,9 +1039,10 @@ async def stuck_task_monitor():
                         task["id"], "auto_released", "running", "pending",
                         "Task auto-released due to timeout (2 hours)", "system"
                     )
-            await pool.close()
         except Exception as e:
             print(f"Stuck task monitor error: {e}")
+            # 出错时重置连接池，下次循环会重新创建
+            pool = None
 
 
 if __name__ == "__main__":
