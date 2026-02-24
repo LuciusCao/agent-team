@@ -26,6 +26,10 @@ services:
       DATABASE_URL: postgresql://taskmanager:taskmanager@postgres:5432/taskmanager
       # 每个 Agent 最大并发任务数（多任务模式）
       MAX_CONCURRENT_TASKS_PER_AGENT: ${MAX_CONCURRENT_TASKS_PER_AGENT:-3}
+      # API 认证（生产环境必须设置）
+      API_KEY: ${API_KEY:-}
+      # 速率限制：每 IP 每分钟最大请求数
+      RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-100}
     ports:
       - "8080:8080"
     depends_on:
