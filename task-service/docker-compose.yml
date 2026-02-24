@@ -24,6 +24,8 @@ services:
     container_name: task-service
     environment:
       DATABASE_URL: postgresql://taskmanager:taskmanager@postgres:5432/taskmanager
+      # 每个 Agent 最大并发任务数（多任务模式）
+      MAX_CONCURRENT_TASKS_PER_AGENT: ${MAX_CONCURRENT_TASKS_PER_AGENT:-3}
     ports:
       - "8080:8080"
     depends_on:

@@ -116,6 +116,53 @@ async def check_dependencies(conn: asyncpg.Connection, task_id: int) -> tuple[bo
     return True, []
 
 
+# ============ Agent Status Helper ============
+
+async def update_agent_status_after_task_change(conn: asyncpg.Connection, agent_name: str):
+    """任务变更后更新 Agent 状态
+    
+    检查 Agent 是否还有其他进行中的任务：
+    - 如果没有，设为 online，current_task_id = NULL
+    - 如果有，设为 busy，current_task_id = 其中一个任务ID
+    
+    Args:
+        conn: 数据库连接
+        agent_name: Agent 名称
+    """
+    # 检查是否还有其他进行中的任务
+    other_tasks = await conn.fetchrow(
+        """
+        SELECT COUNT(*) as count, 
+               MIN(id) as next_task_id
+        FROM tasks 
+        WHERE assignee_agent = $1 
+        AND status IN ('assigned', 'running', 'reviewing')
+        """,
+        agent_name
+    )
+    
+    if other_tasks['count'] == 0:
+        # 没有其他任务了，设为 online
+        await conn.execute(
+            """
+            UPDATE agents 
+            SET status = 'online', current_task_id = NULL, updated_at = NOW()
+            WHERE name = $1
+            """,
+            agent_name
+        )
+    else:
+        # 还有其他任务，设为 busy，更新 current_task_id
+        await conn.execute(
+            """
+            UPDATE agents 
+            SET status = 'busy', current_task_id = $1, updated_at = NOW()
+            WHERE name = $2
+            """,
+            other_tasks['next_task_id'], agent_name
+        )
+
+
 # ============ API Routes ============
 
 @app.get("/")
@@ -369,12 +416,34 @@ async def get_available_tasks_for_agent(
 
 @app.post("/tasks/{task_id}/claim")
 async def claim_task(task_id: int, agent_name: str, db=Depends(get_db)):
-    """Agent 认领任务（带依赖检查和原子性乐观锁）"""
+    """Agent 认领任务（带依赖检查和原子性乐观锁）
+    
+    支持多任务模式，但限制最大并发任务数（默认 3 个）。
+    """
+    # 最大并发任务数配置
+    MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS_PER_AGENT", "3"))
+    
     async with db.acquire() as conn:
         # 检查依赖
         deps_ok, deps = await check_dependencies(conn, task_id)
         if not deps_ok:
             raise HTTPException(status_code=400, detail=f"Dependencies not completed: {deps}")
+        
+        # 检查 Agent 当前并发任务数
+        current_tasks = await conn.fetchrow(
+            """
+            SELECT COUNT(*) as count 
+            FROM tasks 
+            WHERE assignee_agent = $1 AND status IN ('assigned', 'running', 'reviewing')
+            """,
+            agent_name
+        )
+        
+        if current_tasks['count'] >= MAX_CONCURRENT_TASKS:
+            raise HTTPException(
+                status_code=429, 
+                detail=f"Agent {agent_name} has reached maximum concurrent tasks limit ({MAX_CONCURRENT_TASKS})"
+            )
         
         # 原子性认领：使用 UPDATE ... RETURNING 确保只有一个 Agent 能成功
         # 这避免了 SELECT + UPDATE 之间的竞态条件
@@ -416,7 +485,11 @@ async def claim_task(task_id: int, agent_name: str, db=Depends(get_db)):
 
 @app.post("/tasks/{task_id}/start")
 async def start_task(task_id: int, agent_name: str, db=Depends(get_db)):
-    """Agent 开始执行任务"""
+    """Agent 开始执行任务
+    
+    限制：一个 Agent 同一时间只能执行一个任务（running 状态）。
+    可以认领多个任务（assigned），但只能依次执行。
+    """
     async with db.acquire() as conn:
         task = await conn.fetchrow(
             "SELECT * FROM tasks WHERE id = $1 AND assignee_agent = $2",
@@ -427,6 +500,18 @@ async def start_task(task_id: int, agent_name: str, db=Depends(get_db)):
         
         if task["status"] != "assigned":
             raise HTTPException(status_code=400, detail=f"Cannot start task with status: {task['status']}")
+        
+        # 检查是否已经有执行中的任务
+        running_task = await conn.fetchrow(
+            "SELECT id, title FROM tasks WHERE assignee_agent = $1 AND status = 'running'",
+            agent_name
+        )
+        if running_task:
+            raise HTTPException(
+                status_code=409, 
+                detail=f"Already has a running task (#{running_task['id']} - {running_task['title']}). "
+                       f"Please complete or release it before starting a new one."
+            )
         
         result = await conn.fetchrow(
             """
@@ -486,7 +571,11 @@ async def submit_task(task_id: int, agent_name: str, result: dict, db=Depends(ge
 
 @app.post("/tasks/{task_id}/release")
 async def release_task(task_id: int, agent_name: str, db=Depends(get_db)):
-    """Agent 释放任务（重新变成 pending）"""
+    """Agent 释放任务（重新变成 pending）
+    
+    注意：如果 Agent 有多个任务，释放一个后状态应该保持 busy，
+    直到所有任务都完成或释放。
+    """
     async with db.acquire() as conn:
         task = await conn.fetchrow(
             "SELECT * FROM tasks WHERE id = $1 AND assignee_agent = $2",
@@ -509,15 +598,8 @@ async def release_task(task_id: int, agent_name: str, db=Depends(get_db)):
             task_id
         )
         
-        # 更新 Agent 状态
-        await conn.execute(
-            """
-            UPDATE agents 
-            SET status = 'online', current_task_id = NULL, updated_at = NOW()
-            WHERE name = $1
-            """,
-            agent_name
-        )
+        # 更新 Agent 状态（考虑多任务场景）
+        await update_agent_status_after_task_change(conn, agent_name)
         
         await conn.execute(
             """
@@ -607,13 +689,13 @@ async def update_task(task_id: int, update: TaskUpdate, db=Depends(get_db)):
                         SET completed_tasks = completed_tasks + 1, 
                             total_tasks = total_tasks + 1,
                             success_rate = (completed_tasks::FLOAT + 1) / NULLIF(total_tasks + 1, 0),
-                            status = 'online',
-                            current_task_id = NULL,
                             updated_at = NOW()
                         WHERE name = $1
                         """,
                         current["assignee_agent"]
                     )
+                    # 更新 Agent 状态（考虑多任务场景）
+                    await update_agent_status_after_task_change(conn, current["assignee_agent"])
             elif update.status == "failed":
                 if current["assignee_agent"]:
                     await conn.execute(
@@ -622,13 +704,13 @@ async def update_task(task_id: int, update: TaskUpdate, db=Depends(get_db)):
                         SET failed_tasks = failed_tasks + 1,
                             total_tasks = total_tasks + 1,
                             success_rate = (completed_tasks::FLOAT) / NULLIF(total_tasks + 1, 0),
-                            status = 'online',
-                            current_task_id = NULL,
                             updated_at = NOW()
                         WHERE name = $1
                         """,
                         current["assignee_agent"]
                     )
+                    # 更新 Agent 状态（考虑多任务场景）
+                    await update_agent_status_after_task_change(conn, current["assignee_agent"])
         
         if update.result is not None:
             updates.append(f"result = ${param_num}")
@@ -691,13 +773,13 @@ async def review_task(task_id: int, review: TaskReview, reviewer: str, db=Depend
                     """
                     UPDATE agents 
                     SET completed_tasks = completed_tasks + 1,
-                        status = 'online',
-                        current_task_id = NULL,
                         updated_at = NOW()
                     WHERE name = $1
                     """,
                     task["assignee_agent"]
                 )
+                # 更新 Agent 状态（考虑多任务场景）
+                await update_agent_status_after_task_change(conn, task["assignee_agent"])
         else:
             new_status = "rejected"
             # 更新 Agent 统计
@@ -706,13 +788,13 @@ async def review_task(task_id: int, review: TaskReview, reviewer: str, db=Depend
                     """
                     UPDATE agents 
                     SET failed_tasks = failed_tasks + 1,
-                        status = 'online',
-                        current_task_id = NULL,
                         updated_at = NOW()
                     WHERE name = $1
                     """,
                     task["assignee_agent"]
                 )
+                # 更新 Agent 状态（考虑多任务场景）
+                await update_agent_status_after_task_change(conn, task["assignee_agent"])
         
         await conn.execute(
             """
