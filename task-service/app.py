@@ -11,8 +11,9 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, List
 from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Depends, Query, Security, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 import asyncpg
 
 app = FastAPI(title="Task Management Service", version="1.1.0")
@@ -29,12 +30,71 @@ app.add_middleware(
 DB_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/taskmanager")
 pool: Optional[asyncpg.Pool] = None
 
+# Security
+API_KEY = os.getenv("API_KEY")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+# Rate limiting
+RATE_LIMIT_WINDOW = 60  # 1 minute
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "100"))
+rate_limit_store = {}  # Simple in-memory store
+
 
 async def get_db():
     global pool
     if pool is None:
         pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
     return pool
+
+
+async def verify_api_key(api_key: str = Security(api_key_header)):
+    """验证 API Key
+    
+    如果环境变量 API_KEY 未设置，则跳过验证（开发环境）。
+    生产环境必须设置 API_KEY。
+    """
+    if API_KEY is None:
+        # 开发环境：未设置 API_KEY 时不验证
+        return None
+    
+    if api_key is None:
+        raise HTTPException(status_code=403, detail="API Key required")
+    
+    if api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+    
+    return api_key
+
+
+async def rate_limit(request: Request):
+    """简单的速率限制
+    
+    基于客户端 IP 的滑动窗口限流。
+    生产环境建议使用 Redis。
+    """
+    client_ip = request.client.host
+    current_time = datetime.now().timestamp()
+    
+    # 清理过期的记录
+    if client_ip in rate_limit_store:
+        rate_limit_store[client_ip] = [
+            ts for ts in rate_limit_store[client_ip]
+            if current_time - ts < RATE_LIMIT_WINDOW
+        ]
+    else:
+        rate_limit_store[client_ip] = []
+    
+    # 检查是否超过限制
+    if len(rate_limit_store[client_ip]) >= RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Max {RATE_LIMIT_MAX_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds"
+        )
+    
+    # 记录本次请求
+    rate_limit_store[client_ip].append(current_time)
+    
+    return True
 
 
 # ============ Pydantic Models ============
@@ -116,6 +176,39 @@ async def check_dependencies(conn: asyncpg.Connection, task_id: int) -> tuple[bo
     return True, []
 
 
+
+def validate_task_dependencies(tasks: List[TaskCreate]) -> None:
+    """验证任务依赖关系，检测循环依赖"""
+    from collections import defaultdict, deque
+    
+    n = len(tasks)
+    graph = defaultdict(list)
+    in_degree = [0] * n
+    
+    for i, task in enumerate(tasks):
+        if task.dependencies:
+            for dep_idx in task.dependencies:
+                if dep_idx < 0 or dep_idx >= n:
+                    raise HTTPException(status_code=400, detail=f"Invalid dependency index: {dep_idx}")
+                if dep_idx == i:
+                    raise HTTPException(status_code=400, detail=f"Task cannot depend on itself")
+                graph[dep_idx].append(i)
+                in_degree[i] += 1
+    
+    queue = deque([i for i in range(n) if in_degree[i] == 0])
+    visited = 0
+    
+    while queue:
+        node = queue.popleft()
+        visited += 1
+        for neighbor in graph[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+    
+    if visited != n:
+        raise HTTPException(status_code=400, detail="Circular dependency detected")
+
 # ============ Agent Status Helper ============
 
 async def update_agent_status_after_task_change(conn: asyncpg.Connection, agent_name: str):
@@ -172,7 +265,7 @@ async def root():
 
 # ============ Project Endpoints ============
 
-@app.post("/projects")
+@app.post("/projects", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def create_project(project: ProjectCreate, db=Depends(get_db)):
     async with db.acquire() as conn:
         result = await conn.fetchrow(
@@ -186,7 +279,7 @@ async def create_project(project: ProjectCreate, db=Depends(get_db)):
     return result
 
 
-@app.get("/projects")
+@app.get("/projects", dependencies=[Depends(rate_limit)])
 async def list_projects(status: Optional[str] = None, db=Depends(get_db)):
     async with db.acquire() as conn:
         if status:
@@ -199,7 +292,7 @@ async def list_projects(status: Optional[str] = None, db=Depends(get_db)):
     return results
 
 
-@app.get("/projects/{project_id}")
+@app.get("/projects/{project_id}", dependencies=[Depends(rate_limit)])
 async def get_project(project_id: int, db=Depends(get_db)):
     async with db.acquire() as conn:
         project = await conn.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
@@ -208,7 +301,7 @@ async def get_project(project_id: int, db=Depends(get_db)):
     return project
 
 
-@app.get("/projects/{project_id}/progress")
+@app.get("/projects/{project_id}/progress", dependencies=[Depends(rate_limit)])
 async def get_project_progress(project_id: int, db=Depends(get_db)):
     """获取项目进度统计"""
     async with db.acquire() as conn:
@@ -246,9 +339,15 @@ async def get_project_progress(project_id: int, db=Depends(get_db)):
     }
 
 
-@app.post("/projects/{project_id}/breakdown")
+@app.post("/projects/{project_id}/breakdown", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def breakdown_project(project_id: int, tasks: List[TaskCreate], db=Depends(get_db)):
-    """项目拆分：批量创建任务"""
+    """项目拆分：批量创建任务
+    
+    会自动验证依赖关系，检测循环依赖。
+    """
+    # 验证依赖关系（在数据库操作前）
+    validate_task_dependencies(tasks)
+    
     async with db.acquire() as conn:
         # 检查项目存在
         project = await conn.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
@@ -285,7 +384,7 @@ async def breakdown_project(project_id: int, tasks: List[TaskCreate], db=Depends
 
 # ============ Task Endpoints ============
 
-@app.post("/tasks")
+@app.post("/tasks", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def create_task(task: TaskCreate, db=Depends(get_db)):
     async with db.acquire() as conn:
         result = await conn.fetchrow(
@@ -310,7 +409,7 @@ async def create_task(task: TaskCreate, db=Depends(get_db)):
     return result
 
 
-@app.get("/tasks")
+@app.get("/tasks", dependencies=[Depends(rate_limit)])
 async def list_tasks(
     project_id: Optional[int] = None,
     status: Optional[str] = None,
@@ -347,31 +446,89 @@ async def list_tasks(
     return results
 
 
-@app.get("/tasks/available")
+
+@app.get("/tasks/available", dependencies=[Depends(rate_limit)])
 async def get_available_tasks(db=Depends(get_db)):
-    """获取可认领的任务（pending 状态，没有 assignee，依赖已完成）"""
+    """获取可认领的任务（pending 状态，没有 assignee，依赖已完成）
+    
+    使用 SQL 子查询一次性过滤掉依赖未完成的任务，避免 N+1 查询。
+    """
     async with db.acquire() as conn:
-        # 获取所有 pending 且未分配的任务
-        pending = await conn.fetch(
+        # 使用 NOT EXISTS 一次性查询依赖已完成的任务
+        # 避免 Python 循环中的 N+1 查询
+        results = await conn.fetch(
             """
-            SELECT * FROM tasks 
-            WHERE status = 'pending' AND assignee_agent IS NULL
-            ORDER BY priority DESC, created_at ASC
+            SELECT t.* 
+            FROM tasks t
+            WHERE t.status = 'pending' 
+            AND t.assignee_agent IS NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM tasks dep 
+                WHERE dep.id = ANY(t.dependencies) 
+                AND dep.status != 'completed'
+            )
+            ORDER BY t.priority DESC, t.created_at ASC
             """
         )
-        
-        # 过滤掉依赖未完成的任务
-        available = []
-        for task in pending:
-            deps_ok, _ = await check_dependencies(conn, task["id"])
-            if deps_ok:
-                available.append(dict(task))
     
-    return available
+    return [dict(row) for row in results]
 
 
-@app.get("/tasks/available-for/{agent_name}")
+@app.get("/tasks/available-for/{agent_name}", dependencies=[Depends(rate_limit)])
 async def get_available_tasks_for_agent(
+    agent_name: str,
+    skill_match: bool = True,
+    db=Depends(get_db)
+):
+    """获取适合某 Agent 的任务（带技能匹配）
+    
+    使用 SQL JOIN 和子查询一次性完成依赖检查和技能匹配，避免 N+1 查询。
+    """
+    async with db.acquire() as conn:
+        # 获取 Agent 信息
+        agent = await conn.fetchrow("SELECT * FROM agents WHERE name = $1", agent_name)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        
+        agent_skills = agent["skills"] or []
+        
+        if skill_match and agent_skills:
+            # 技能匹配模式：使用数组交集操作符 &&
+            # 一次性完成：依赖检查 + 技能匹配
+            results = await conn.fetch(
+                """
+                SELECT t.* 
+                FROM tasks t
+                WHERE t.status = 'pending' 
+                AND t.assignee_agent IS NULL
+                AND t.task_tags && $1  -- 技能标签匹配
+                AND NOT EXISTS (
+                    SELECT 1 FROM tasks dep 
+                    WHERE dep.id = ANY(t.dependencies) 
+                    AND dep.status != 'completed'
+                )
+                ORDER BY t.priority DESC, t.created_at ASC
+                """,
+                agent_skills
+            )
+        else:
+            # 无技能匹配：只检查依赖
+            results = await conn.fetch(
+                """
+                SELECT t.* 
+                FROM tasks t
+                WHERE t.status = 'pending' 
+                AND t.assignee_agent IS NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM tasks dep 
+                    WHERE dep.id = ANY(t.dependencies) 
+                    AND dep.status != 'completed'
+                )
+                ORDER BY t.priority DESC, t.created_at ASC
+                """
+            )
+    
+    return [dict(row) for row in results]
     agent_name: str,
     skill_match: bool = True,
     db=Depends(get_db)
@@ -414,7 +571,7 @@ async def get_available_tasks_for_agent(
     return available
 
 
-@app.post("/tasks/{task_id}/claim")
+@app.post("/tasks/{task_id}/claim", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def claim_task(task_id: int, agent_name: str, db=Depends(get_db)):
     """Agent 认领任务（带依赖检查和原子性乐观锁）
     
@@ -483,7 +640,7 @@ async def claim_task(task_id: int, agent_name: str, db=Depends(get_db)):
     return result
 
 
-@app.post("/tasks/{task_id}/start")
+@app.post("/tasks/{task_id}/start", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def start_task(task_id: int, agent_name: str, db=Depends(get_db)):
     """Agent 开始执行任务
     
@@ -534,7 +691,7 @@ async def start_task(task_id: int, agent_name: str, db=Depends(get_db)):
     return result
 
 
-@app.post("/tasks/{task_id}/submit")
+@app.post("/tasks/{task_id}/submit", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def submit_task(task_id: int, agent_name: str, result: dict, db=Depends(get_db)):
     """Agent 提交任务完成，进入验收阶段"""
     async with db.acquire() as conn:
@@ -569,7 +726,7 @@ async def submit_task(task_id: int, agent_name: str, result: dict, db=Depends(ge
     return updated
 
 
-@app.post("/tasks/{task_id}/release")
+@app.post("/tasks/{task_id}/release", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def release_task(task_id: int, agent_name: str, db=Depends(get_db)):
     """Agent 释放任务（重新变成 pending）
     
@@ -612,7 +769,7 @@ async def release_task(task_id: int, agent_name: str, db=Depends(get_db)):
     return result
 
 
-@app.post("/tasks/{task_id}/retry")
+@app.post("/tasks/{task_id}/retry", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def retry_task(task_id: int, db=Depends(get_db)):
     """重试失败或被拒绝的任务"""
     async with db.acquire() as conn:
@@ -648,7 +805,7 @@ async def retry_task(task_id: int, db=Depends(get_db)):
     return result
 
 
-@app.get("/tasks/{task_id}")
+@app.get("/tasks/{task_id}", dependencies=[Depends(rate_limit)])
 async def get_task(task_id: int, db=Depends(get_db)):
     async with db.acquire() as conn:
         task = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
@@ -661,7 +818,7 @@ async def get_task(task_id: int, db=Depends(get_db)):
     return {"task": dict(task), "logs": [dict(l) for l in logs]}
 
 
-@app.patch("/tasks/{task_id}")
+@app.patch("/tasks/{task_id}", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def update_task(task_id: int, update: TaskUpdate, db=Depends(get_db)):
     async with db.acquire() as conn:
         current = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
@@ -754,7 +911,7 @@ async def update_task(task_id: int, update: TaskUpdate, db=Depends(get_db)):
     return result
 
 
-@app.post("/tasks/{task_id}/review")
+@app.post("/tasks/{task_id}/review", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def review_task(task_id: int, review: TaskReview, reviewer: str, db=Depends(get_db)):
     """验收任务 - 支持通过、拒绝"""
     async with db.acquire() as conn:
@@ -819,7 +976,7 @@ async def review_task(task_id: int, review: TaskReview, reviewer: str, db=Depend
     return updated
 
 
-@app.get("/projects/{project_id}/tasks")
+@app.get("/projects/{project_id}/tasks", dependencies=[Depends(rate_limit)])
 async def get_project_tasks(project_id: int, db=Depends(get_db)):
     async with db.acquire() as conn:
         results = await conn.fetch(
@@ -831,7 +988,7 @@ async def get_project_tasks(project_id: int, db=Depends(get_db)):
 
 # ============ Agent Endpoints ============
 
-@app.post("/agents/register")
+@app.post("/agents/register", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def register_agent(agent: AgentRegister, db=Depends(get_db)):
     async with db.acquire() as conn:
         result = await conn.fetchrow(
@@ -854,7 +1011,7 @@ async def register_agent(agent: AgentRegister, db=Depends(get_db)):
     return result
 
 
-@app.post("/agents/{name}/heartbeat")
+@app.post("/agents/{name}/heartbeat", dependencies=[Depends(rate_limit)])
 async def agent_heartbeat(name: str, data: AgentHeartbeat, db=Depends(get_db)):
     async with db.acquire() as conn:
         result = await conn.fetchrow(
@@ -869,7 +1026,7 @@ async def agent_heartbeat(name: str, data: AgentHeartbeat, db=Depends(get_db)):
     return result
 
 
-@app.get("/agents")
+@app.get("/agents", dependencies=[Depends(rate_limit)])
 async def list_agents(status: Optional[str] = None, skill: Optional[str] = None, db=Depends(get_db)):
     async with db.acquire() as conn:
         if skill:
@@ -887,7 +1044,7 @@ async def list_agents(status: Optional[str] = None, skill: Optional[str] = None,
     return results
 
 
-@app.get("/agents/{name}")
+@app.get("/agents/{name}", dependencies=[Depends(rate_limit)])
 async def get_agent(name: str, db=Depends(get_db)):
     async with db.acquire() as conn:
         agent = await conn.fetchrow("SELECT * FROM agents WHERE name = $1", name)
@@ -896,7 +1053,7 @@ async def get_agent(name: str, db=Depends(get_db)):
     return agent
 
 
-@app.delete("/agents/{name}")
+@app.delete("/agents/{name}", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def unregister_agent(name: str, db=Depends(get_db)):
     async with db.acquire() as conn:
         await conn.execute("DELETE FROM agents WHERE name = $1", name)
@@ -905,7 +1062,7 @@ async def unregister_agent(name: str, db=Depends(get_db)):
 
 # ============ Dashboard Endpoints ============
 
-@app.get("/dashboard/stats")
+@app.get("/dashboard/stats", dependencies=[Depends(rate_limit)])
 async def get_dashboard_stats(db=Depends(get_db)):
     """获取仪表盘统计数据"""
     async with db.acquire() as conn:
@@ -966,7 +1123,7 @@ async def get_dashboard_stats(db=Depends(get_db)):
 
 # ============ Agent Channel Endpoints ============
 
-@app.post("/agent-channels")
+@app.post("/agent-channels", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def register_agent_channel(ac: AgentChannel, db=Depends(get_db)):
     async with db.acquire() as conn:
         agent = await conn.fetchrow("SELECT * FROM agents WHERE name = $1", ac.agent_name)
@@ -993,7 +1150,7 @@ async def register_agent_channel(ac: AgentChannel, db=Depends(get_db)):
     return result
 
 
-@app.get("/agents/{name}/channels")
+@app.get("/agents/{name}/channels", dependencies=[Depends(rate_limit)])
 async def get_agent_channels(name: str, db=Depends(get_db)):
     async with db.acquire() as conn:
         results = await conn.fetch(
@@ -1003,7 +1160,7 @@ async def get_agent_channels(name: str, db=Depends(get_db)):
     return results
 
 
-@app.get("/channels/{channel_id}/agents")
+@app.get("/channels/{channel_id}/agents", dependencies=[Depends(rate_limit)])
 async def get_channel_agents(channel_id: str, db=Depends(get_db)):
     async with db.acquire() as conn:
         results = await conn.fetch(
@@ -1018,7 +1175,7 @@ async def get_channel_agents(channel_id: str, db=Depends(get_db)):
     return results
 
 
-@app.delete("/agent-channels")
+@app.delete("/agent-channels", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def unregister_agent_channel(ac: AgentChannel, db=Depends(get_db)):
     async with db.acquire() as conn:
         await conn.execute(
