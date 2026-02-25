@@ -21,7 +21,41 @@
 
 ## 快速开始
 
-### 1. 安装依赖
+### 开发环境快速启动（推荐）
+
+使用开发工具脚本快速管理环境：
+
+```bash
+cd task-service
+
+# 启动开发环境（首次或需要干净环境）
+./scripts/dev.sh start --fresh
+
+# 生成测试数据
+./scripts/dev.sh seed --projects 3 --tasks 5
+
+# 查看服务状态
+./scripts/dev.sh status
+
+# 查看日志
+./scripts/dev.sh logs -f
+
+# 运行测试
+./scripts/dev.sh test
+
+# 停止服务
+./scripts/dev.sh stop
+```
+
+更多脚本功能详见 [task-service/scripts/README.md](task-service/scripts/README.md)
+
+---
+
+### 手动启动（传统方式）
+
+如果你不想使用脚本，也可以手动启动：
+
+#### 1. 安装依赖
 
 - Docker Desktop
 
@@ -31,7 +65,7 @@ export PATH="$PATH:$HOME/GitHub/agent-team"
 source ~/.zshrc
 ```
 
-### 2. 启动任务服务
+#### 2. 启动任务服务
 
 ```bash
 cd task-service
@@ -560,6 +594,59 @@ def check_task_status(task_id):
 # 用户说："认领任务 5"
 # Agent 会调用 claim_task(5, AGENT_NAME)
 ```
+
+## 开发工具
+
+### 开发脚本（推荐）
+
+项目提供了便捷的开发脚本，位于 `task-service/scripts/` 目录：
+
+```bash
+cd task-service
+
+# 查看所有可用命令
+./scripts/dev.sh help
+
+# 常用命令
+./scripts/dev.sh start --fresh    # 干净启动环境
+./scripts/dev.sh seed             # 生成测试数据
+./scripts/dev.sh logs -f          # 跟踪日志
+./scripts/dev.sh test             # 运行测试
+./scripts/dev.sh clean --all      # 完全清空环境
+```
+
+详细文档：[task-service/scripts/README.md](task-service/scripts/README.md)
+
+### API 版本
+
+当前支持 API v1，所有端点以 `/v1/` 开头。旧的无版本前缀端点仍然可用但已标记为 deprecated。
+
+```
+# 推荐
+GET /v1/tasks
+POST /v1/projects
+
+# 已废弃（仍可用）
+GET /tasks
+POST /projects
+```
+
+### 软删除
+
+任务、Agent 和项目支持软删除：
+
+```bash
+# 软删除（默认）
+DELETE /v1/tasks/1
+
+# 物理删除
+DELETE /v1/tasks/1?hard=true
+
+# 恢复软删除
+POST /v1/tasks/1/restore
+```
+
+软删除的记录会在 30 天后自动清理。
 
 ## 数据库 Schema
 
