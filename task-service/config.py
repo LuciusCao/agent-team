@@ -15,7 +15,6 @@ class Config:
     DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "2"))
     DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
     DB_COMMAND_TIMEOUT = int(os.getenv("DB_COMMAND_TIMEOUT", "60"))
-    DB_MAX_INACTIVE_TIME = int(os.getenv("DB_MAX_INACTIVE_TIME", "300"))
     DB_MAX_QUERIES = int(os.getenv("DB_MAX_QUERIES", "100000"))
 
     # API 配置

@@ -22,7 +22,6 @@ async def _create_pool() -> asyncpg.Pool:
         min_size=Config.DB_POOL_MIN_SIZE,
         max_size=Config.DB_POOL_MAX_SIZE,
         command_timeout=Config.DB_COMMAND_TIMEOUT,
-        max_inactive_time=Config.DB_MAX_INACTIVE_TIME,
         max_queries=Config.DB_MAX_QUERIES,
         timeout=10,  # 连接建立超时（秒）
         server_settings={
