@@ -22,7 +22,7 @@ async def get_dashboard_stats(db=Depends(get_db)):
             FROM projects
             """
         )
-        
+
         task_stats = await conn.fetchrow(
             """
             SELECT 
@@ -37,7 +37,7 @@ async def get_dashboard_stats(db=Depends(get_db)):
             FROM tasks
             """
         )
-        
+
         agent_stats = await conn.fetchrow(
             """
             SELECT 
@@ -48,7 +48,7 @@ async def get_dashboard_stats(db=Depends(get_db)):
             FROM agents
             """
         )
-        
+
         recent_logs = await conn.fetch(
             """
             SELECT * FROM task_logs 
@@ -56,7 +56,7 @@ async def get_dashboard_stats(db=Depends(get_db)):
             LIMIT 10
             """
         )
-    
+
     return {
         "projects": dict(project_stats),
         "tasks": dict(task_stats),

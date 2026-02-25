@@ -2,12 +2,12 @@
 Project API Router
 """
 
-from typing import Optional
-from fastapi import APIRouter, HTTPException, Depends
+
+from fastapi import APIRouter, Depends, HTTPException
 
 from database import get_db
-from security import verify_api_key, rate_limit
 from models import ProjectCreate, TaskCreate
+from security import rate_limit, verify_api_key
 from utils import validate_task_dependencies
 
 router = APIRouter()
@@ -28,7 +28,7 @@ async def create_project(project: ProjectCreate, db=Depends(get_db)):
 
 
 @router.get("/", dependencies=[Depends(rate_limit)])
-async def list_projects(status: Optional[str] = None, db=Depends(get_db)):
+async def list_projects(status: str | None = None, db=Depends(get_db)):
     async with db.acquire() as conn:
         if status:
             results = await conn.fetch(
@@ -56,7 +56,7 @@ async def get_project_progress(project_id: int, db=Depends(get_db)):
         project = await conn.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
-        
+
         stats = await conn.fetchrow(
             """
             SELECT 
@@ -72,11 +72,11 @@ async def get_project_progress(project_id: int, db=Depends(get_db)):
             """,
             project_id
         )
-        
+
         total = stats["total"] or 0
         completed = stats["completed"] or 0
         progress = (completed / total * 100) if total > 0 else 0
-    
+
     return {
         "project_id": project_id,
         "project_name": project["name"],
@@ -90,12 +90,12 @@ async def get_project_progress(project_id: int, db=Depends(get_db)):
 async def breakdown_project(project_id: int, tasks: list[TaskCreate], db=Depends(get_db)):
     """项目拆分：批量创建任务"""
     validate_task_dependencies(tasks)
-    
+
     async with db.acquire() as conn:
         project = await conn.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
-        
+
         created_tasks = []
         for task in tasks:
             result = await conn.fetchrow(
@@ -112,14 +112,14 @@ async def breakdown_project(project_id: int, tasks: list[TaskCreate], db=Depends
                 task.parent_task_id, task.dependencies, task.task_tags, task.estimated_hours,
                 task.created_by, task.due_at
             )
-            
+
             await conn.execute(
                 "INSERT INTO task_logs (task_id, action, message, actor) VALUES ($1, $2, $3, $4)",
                 result["id"], "created", f"Task created via breakdown: {task.title}", task.created_by or "system"
             )
-            
+
             created_tasks.append(dict(result))
-    
+
     return {"project_id": project_id, "tasks_created": len(created_tasks), "tasks": created_tasks}
 
 

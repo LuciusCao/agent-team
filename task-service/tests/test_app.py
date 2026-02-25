@@ -8,12 +8,12 @@ Task Service 测试套件
     DATABASE_URL=postgresql://taskmanager:taskmanager@localhost:5433/taskmanager_test
 """
 
+import asyncio
 import os
+
 import pytest
 import pytest_asyncio
-import asyncio
-from datetime import datetime, timedelta
-from httpx import AsyncClient, ASGITransport
+from httpx import ASGITransport, AsyncClient
 
 # 设置测试环境
 os.environ["DATABASE_URL"] = "postgresql://taskmanager:taskmanager@localhost:5433/taskmanager_test"
@@ -21,8 +21,8 @@ os.environ["API_KEY"] = "test-api-key"
 os.environ["LOG_LEVEL"] = "DEBUG"
 
 import asyncpg
-from main import app, get_db
 
+from main import app, get_db
 
 # ============ 数据库初始化 ============
 
@@ -30,7 +30,7 @@ async def init_test_database():
     """初始化测试数据库（只运行一次）"""
     admin_url = "postgresql://taskmanager:taskmanager@localhost:5433/postgres"
     test_db_url = "postgresql://taskmanager:taskmanager@localhost:5433/taskmanager_test"
-    
+
     # 连接到 postgres 数据库创建测试数据库
     conn = await asyncpg.connect(admin_url)
     try:
@@ -45,11 +45,11 @@ async def init_test_database():
         await conn.execute("CREATE DATABASE taskmanager_test")
     finally:
         await conn.close()
-    
+
     # 连接到测试数据库并执行 schema
     conn = await asyncpg.connect(test_db_url)
     try:
-        with open("schema.sql", "r") as f:
+        with open("schema.sql") as f:
             schema = f.read()
             await conn.execute(schema)
     finally:
@@ -66,16 +66,16 @@ asyncio.run(init_test_database())
 async def test_db():
     """每个测试使用独立的数据库连接池"""
     test_db_url = "postgresql://taskmanager:taskmanager@localhost:5433/taskmanager_test"
-    
+
     # 创建连接池
     pool = await asyncpg.create_pool(test_db_url, min_size=1, max_size=5)
-    
+
     yield pool
-    
+
     # 清理数据
     async with pool.acquire() as conn:
         await conn.execute("TRUNCATE TABLE task_logs, tasks, agents, projects, agent_channels, idempotency_keys RESTART IDENTITY CASCADE")
-    
+
     await pool.close()
 
 
@@ -85,13 +85,13 @@ async def client(test_db):
     # 覆盖 get_db 使用测试连接池
     async def override_get_db():
         return test_db
-    
+
     app.dependency_overrides[get_db] = override_get_db
-    
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
-    
+
     app.dependency_overrides.clear()
 
 
@@ -105,7 +105,7 @@ def auth_headers():
 
 class TestHealth:
     """健康检查测试"""
-    
+
     async def test_root(self, client):
         """测试根路径"""
         response = await client.get("/")
@@ -116,12 +116,12 @@ class TestHealth:
 
 class TestAuth:
     """认证测试"""
-    
+
     async def test_missing_api_key(self, client):
         """测试缺少 API Key"""
         response = await client.post("/projects/", json={"name": "Test"})
         assert response.status_code == 403
-    
+
     async def test_invalid_api_key(self, client):
         """测试无效的 API Key"""
         response = await client.post(
@@ -134,7 +134,7 @@ class TestAuth:
 
 class TestProjects:
     """项目 API 测试"""
-    
+
     async def test_create_project(self, client, auth_headers):
         """测试创建项目"""
         response = await client.post(
@@ -146,14 +146,14 @@ class TestProjects:
         data = response.json()
         assert data["name"] == "Test Project"
         assert "id" in data
-    
+
     async def test_list_projects(self, client):
         """测试列出项目"""
         response = await client.get("/projects/")
         assert response.status_code == 200
         data = response.json()
         assert isinstance(data, list)
-    
+
     async def test_get_project(self, client, auth_headers):
         """测试获取项目详情"""
         # 先创建项目
@@ -163,13 +163,13 @@ class TestProjects:
             headers=auth_headers
         )
         project = create_resp.json()
-        
+
         # 获取项目
         response = await client.get(f"/projects/{project['id']}")
         assert response.status_code == 200
         data = response.json()
         assert data["id"] == project["id"]
-    
+
     async def test_get_project_not_found(self, client):
         """测试获取不存在的项目"""
         response = await client.get("/projects/99999")
@@ -178,7 +178,7 @@ class TestProjects:
 
 class TestTasks:
     """任务 API 测试"""
-    
+
     async def test_create_task(self, client, auth_headers):
         """测试创建任务"""
         # 先创建项目
@@ -188,7 +188,7 @@ class TestTasks:
             headers=auth_headers
         )
         project = project_resp.json()
-        
+
         # 创建任务
         response = await client.post(
             "/tasks/",
@@ -209,7 +209,7 @@ class TestTasks:
 
 class TestAgents:
     """Agent API 测试"""
-    
+
     async def test_register_agent(self, client, auth_headers):
         """测试注册 Agent"""
         response = await client.post(
@@ -229,7 +229,7 @@ class TestAgents:
 
 class TestTaskLifecycle:
     """任务完整生命周期测试"""
-    
+
     async def test_full_task_lifecycle_success(self, client, auth_headers):
         """测试完整任务流转：pending → assigned → running → reviewing → completed"""
         # 1. 创建项目
@@ -239,7 +239,7 @@ class TestTaskLifecycle:
             headers=auth_headers
         )
         project = project_resp.json()
-        
+
         # 2. 创建任务
         task_resp = await client.post(
             "/tasks/",
@@ -252,14 +252,14 @@ class TestTaskLifecycle:
         )
         task = task_resp.json()
         task_id = task["id"]
-        
+
         # 3. 注册 Agent
         await client.post(
             "/agents/register/",
             json={"name": "lifecycle-agent", "role": "research"},
             headers=auth_headers
         )
-        
+
         # 4. 认领任务 (pending → assigned)
         claim_resp = await client.post(
             f"/tasks/{task_id}/claim/",
@@ -268,7 +268,7 @@ class TestTaskLifecycle:
         )
         assert claim_resp.status_code == 200
         assert claim_resp.json()["status"] == "assigned"
-        
+
         # 5. 开始任务 (assigned → running)
         start_resp = await client.post(
             f"/tasks/{task_id}/start/",
@@ -277,7 +277,7 @@ class TestTaskLifecycle:
         )
         assert start_resp.status_code == 200
         assert start_resp.json()["status"] == "running"
-        
+
         # 6. 提交任务 (running → reviewing)
         submit_resp = await client.post(
             f"/tasks/{task_id}/submit/",
@@ -287,7 +287,7 @@ class TestTaskLifecycle:
         )
         assert submit_resp.status_code == 200
         assert submit_resp.json()["status"] == "reviewing"
-        
+
         # 7. 验收通过 (reviewing → completed)
         review_resp = await client.post(
             f"/tasks/{task_id}/review/",

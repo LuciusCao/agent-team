@@ -2,22 +2,22 @@
 Pydantic models for request/response validation
 """
 
-from typing import Optional, List
 from datetime import datetime
-from pydantic import BaseModel, Field
+
+from pydantic import BaseModel
 
 
 class AgentRegister(BaseModel):
     name: str
-    discord_user_id: Optional[str] = None
+    discord_user_id: str | None = None
     role: str
-    capabilities: Optional[dict] = None
-    skills: Optional[List[str]] = None
+    capabilities: dict | None = None
+    skills: list[str] | None = None
 
 
 class AgentHeartbeat(BaseModel):
     name: str
-    current_task_id: Optional[int] = None
+    current_task_id: int | None = None
 
 
 class AgentChannel(BaseModel):
@@ -27,40 +27,40 @@ class AgentChannel(BaseModel):
 
 class ProjectCreate(BaseModel):
     name: str
-    discord_channel_id: Optional[str] = None
-    description: Optional[str] = None
+    discord_channel_id: str | None = None
+    description: str | None = None
 
 
 class TaskCreate(BaseModel):
     project_id: int
     title: str
-    description: Optional[str] = None
+    description: str | None = None
     task_type: str
-    priority: Optional[int] = 5
-    assignee_agent: Optional[str] = None
-    reviewer_id: Optional[str] = None
-    reviewer_mention: Optional[str] = None
-    acceptance_criteria: Optional[str] = None
-    parent_task_id: Optional[int] = None
-    dependencies: Optional[List[int]] = None
-    task_tags: Optional[List[str]] = None
-    estimated_hours: Optional[float] = None
-    timeout_minutes: Optional[int] = None
-    created_by: Optional[str] = None
-    due_at: Optional[datetime] = None  # Pydantic 自动验证 ISO 格式
+    priority: int | None = 5
+    assignee_agent: str | None = None
+    reviewer_id: str | None = None
+    reviewer_mention: str | None = None
+    acceptance_criteria: str | None = None
+    parent_task_id: int | None = None
+    dependencies: list[int] | None = None
+    task_tags: list[str] | None = None
+    estimated_hours: float | None = None
+    timeout_minutes: int | None = None
+    created_by: str | None = None
+    due_at: datetime | None = None  # Pydantic 自动验证 ISO 格式
 
 
 class TaskUpdate(BaseModel):
-    status: Optional[str] = None
-    result: Optional[dict] = None
-    assignee_agent: Optional[str] = None
-    priority: Optional[int] = None
-    feedback: Optional[str] = None
+    status: str | None = None
+    result: dict | None = None
+    assignee_agent: str | None = None
+    priority: int | None = None
+    feedback: str | None = None
 
 
 class TaskReview(BaseModel):
     approved: bool
-    feedback: Optional[str] = None
+    feedback: str | None = None
 
 
 class HealthStatus(BaseModel):
@@ -68,4 +68,4 @@ class HealthStatus(BaseModel):
     version: str
     timestamp: str
     database: str
-    uptime_seconds: Optional[float] = None
+    uptime_seconds: float | None = None

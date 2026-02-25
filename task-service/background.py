@@ -2,12 +2,10 @@
 Background tasks for monitoring and maintenance
 """
 
-import os
 import asyncio
 import logging
-from datetime import datetime
+import os
 
-import asyncpg
 from database import get_pool, reset_pool
 from utils import update_agent_status_after_task_change
 
@@ -25,7 +23,7 @@ async def heartbeat_monitor():
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         try:
             pool = await get_pool()
-            
+
             async with pool.acquire() as conn:
                 await conn.execute(
                     """
@@ -43,12 +41,12 @@ async def heartbeat_monitor():
 async def stuck_task_monitor():
     """监控卡住的任务，自动释放"""
     DEFAULT_TIMEOUT_MINUTES = int(os.getenv("DEFAULT_TASK_TIMEOUT_MINUTES", "120"))
-    
+
     while True:
         await asyncio.sleep(STUCK_TASK_CHECK_INTERVAL_SECONDS)
         try:
             pool = await get_pool()
-            
+
             async with pool.acquire() as conn:
                 stuck = await conn.fetch(
                     """
@@ -72,7 +70,7 @@ async def stuck_task_monitor():
                     """,
                     DEFAULT_TIMEOUT_MINUTES
                 )
-                
+
                 for task in stuck:
                     timeout = task['effective_timeout_minutes']
                     logger.warning(
@@ -85,7 +83,7 @@ async def stuck_task_monitor():
                             "action": "auto_release_timeout"
                         }
                     )
-                    
+
                     await conn.execute(
                         """
                         UPDATE tasks 
@@ -95,10 +93,10 @@ async def stuck_task_monitor():
                         """,
                         task["id"]
                     )
-                    
+
                     if task["assignee_agent"]:
                         await update_agent_status_after_task_change(conn, task["assignee_agent"])
-                    
+
                     await conn.execute(
                         """
                         INSERT INTO task_logs (task_id, action, old_status, new_status, message, actor)
@@ -107,7 +105,7 @@ async def stuck_task_monitor():
                         task["id"], "auto_released", "running", "pending",
                         f"Task auto-released due to timeout ({timeout} minutes)", "system"
                     )
-        except Exception as e:
+        except Exception:
             logger.error(
                 "Stuck task monitor error",
                 exc_info=True,
