@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -141,7 +141,7 @@ async def root():
 
 # ============ Health Check ============
 
-_start_time = datetime.utcnow()
+_start_time = datetime.now(UTC)
 
 @app.get("/health", dependencies=[Depends(rate_limit)])
 async def health_check(db=Depends(get_db)):
@@ -154,12 +154,12 @@ async def health_check(db=Depends(get_db)):
         logger.error(f"Health check failed: {e}", extra={"action": "health_check_failed"})
         raise HTTPException(status_code=503, detail=f"Database connection failed: {e}")
 
-    uptime = (datetime.utcnow() - _start_time).total_seconds()
+    uptime = (datetime.now(UTC) - _start_time).total_seconds()
 
     return {
         "status": "healthy",
         "version": "1.2.0",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(UTC).isoformat(),
         "database": db_status,
         "uptime_seconds": uptime
     }

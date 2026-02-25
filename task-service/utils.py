@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import wraps
 
 import asyncpg
@@ -19,7 +19,7 @@ logger = logging.getLogger("task_service")
 
 def setup_logging():
     """配置结构化日志
-    
+
     设置根日志记录器和 uvicorn 的日志格式
     """
     logger = logging.getLogger("task_service")
@@ -39,7 +39,7 @@ class JSONFormatter(logging.Formatter):
     """JSON 格式日志格式化器"""
     def format(self, record):
         log_obj = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -195,13 +195,14 @@ async def store_idempotency_response(conn: asyncpg.Connection, idempotency_key: 
 
 # ============ Task Utilities ============
 
-async def check_dependencies(conn: asyncpg.Connection, task_id: int) -> tuple[bool, list]:
+async def check_dependencies(conn: asyncpg.Connection, task_id: int, for_update: bool = False) -> tuple[bool, list]:
     """检查任务依赖是否完成
-    
+
     Args:
         conn: 数据库连接
         task_id: 任务ID
-    
+        for_update: 是否使用 FOR UPDATE 锁定依赖任务（用于写操作）
+
     Returns:
         tuple: (所有依赖完成, 依赖列表)
     """
@@ -213,10 +214,17 @@ async def check_dependencies(conn: asyncpg.Connection, task_id: int) -> tuple[bo
 
     # 检查所有依赖任务是否完成
     for dep_id in deps:
-        dep = await conn.fetchrow(
-            "SELECT status FROM tasks WHERE id = $1",
-            dep_id
-        )
+        if for_update:
+            # 使用 FOR UPDATE 锁定依赖任务，防止竞态条件
+            dep = await conn.fetchrow(
+                "SELECT status FROM tasks WHERE id = $1 FOR UPDATE",
+                dep_id
+            )
+        else:
+            dep = await conn.fetchrow(
+                "SELECT status FROM tasks WHERE id = $1",
+                dep_id
+            )
         if not dep or dep["status"] != "completed":
             return False, deps
 
@@ -396,25 +404,46 @@ def log_structured(level: str, message: str, **kwargs):
 
 class RateLimiter:
     """简单的内存速率限制器
-    
+
     注意：生产环境建议使用 Redis 实现分布式限流
     """
 
-    def __init__(self, window: int = 60, max_requests: int = 100):
+    def __init__(self, window: int = 60, max_requests: int = 100, max_store_size: int = 10000):
         self.window = window
         self.max_requests = max_requests
+        self.max_store_size = max_store_size
         self.store = {}
+        self._last_cleanup_time = 0
+
+    def _cleanup_if_needed(self, current_time: float) -> None:
+        """定期清理过期记录，防止内存泄漏"""
+        if len(self.store) < self.max_store_size and current_time - self._last_cleanup_time < self.window:
+            return
+
+        expired_threshold = current_time - self.window
+        expired_keys = [
+            key for key, timestamps in self.store.items()
+            if not timestamps or all(ts < expired_threshold for ts in timestamps)
+        ]
+
+        for key in expired_keys:
+            del self.store[key]
+
+        self._last_cleanup_time = current_time
 
     def is_allowed(self, key: str) -> bool:
         """检查是否允许请求
-        
+
         Args:
             key: 限制键（通常是客户端IP）
-        
+
         Returns:
             bool: 是否允许
         """
         current_time = datetime.now().timestamp()
+
+        # 定期清理过期记录
+        self._cleanup_if_needed(current_time)
 
         # 清理过期记录
         if key in self.store:
@@ -435,10 +464,10 @@ class RateLimiter:
 
     def get_remaining(self, key: str) -> int:
         """获取剩余请求数
-        
+
         Args:
             key: 限制键
-        
+
         Returns:
             int: 剩余请求数
         """
