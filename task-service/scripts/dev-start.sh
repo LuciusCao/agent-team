@@ -14,6 +14,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+# 检测 docker compose 命令
+if docker compose version &>/dev/null; then
+    DOCKER_COMPOSE="docker compose"
+elif docker-compose version &>/dev/null; then
+    DOCKER_COMPOSE="docker-compose"
+else
+    echo "错误: 未找到 docker compose 命令"
+    exit 1
+fi
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -49,7 +59,7 @@ check_docker() {
 # 清空数据库
 fresh_start() {
     log_warn "正在清空数据库..."
-    docker-compose down -v
+    $DOCKER_COMPOSE down -v
     log_success "数据库已清空"
 }
 
@@ -64,7 +74,7 @@ start_services() {
     fi
     
     # 构建并启动
-    docker-compose up --build -d
+    $DOCKER_COMPOSE up --build -d
     
     log_info "等待服务启动..."
     sleep 3
@@ -104,7 +114,7 @@ check_health() {
 # 查看日志
 show_logs() {
     log_info "查看服务日志（按 Ctrl+C 退出）..."
-    docker-compose logs -f task-service
+    $DOCKER_COMPOSE logs -f task-service
 }
 
 # 显示帮助信息

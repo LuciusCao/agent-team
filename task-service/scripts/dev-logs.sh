@@ -21,6 +21,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+# 检测 docker compose 命令
+if docker compose version &>/dev/null; then
+    DOCKER_COMPOSE="docker compose"
+elif docker-compose version &>/dev/null; then
+    DOCKER_COMPOSE="docker-compose"
+else
+    echo "错误: 未找到 docker compose 命令"
+    exit 1
+fi
+
 # 默认配置
 SERVICE="task-service"
 FOLLOW=false
@@ -91,7 +101,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # 构建命令
-CMD="docker-compose logs"
+CMD="$DOCKER_COMPOSE logs"
 
 if [ "$FOLLOW" = true ]; then
     CMD="$CMD -f"
