@@ -26,14 +26,16 @@ Agent Team 的任务管理服务，提供任务分配、Agent 管理、项目跟
 
 ```bash
 # 启动服务
-docker-compose up -d
+docker compose up -d
 
 # 查看日志
-docker-compose logs -f
+docker compose logs -f
 
 # 停止服务
-docker-compose down
+docker compose down
 ```
+
+**注意**: 推荐使用 `docker compose`（新版），旧版 `docker-compose` 也兼容。
 
 ## 项目结构
 
@@ -76,10 +78,15 @@ task-service/
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `DATABASE_URL` | 数据库连接字符串 | postgresql://localhost:5432/taskmanager |
+| `DB_POOL_MIN_SIZE` | 连接池最小连接数 | 2 |
+| `DB_POOL_MAX_SIZE` | 连接池最大连接数 | 10 |
+| `DB_COMMAND_TIMEOUT` | 数据库命令超时（秒） | 60 |
+| `DB_MAX_QUERIES` | 单个连接最大查询数 | 100000 |
 | `API_KEY` | API 认证密钥 | - |
 | `LOG_LEVEL` | 日志级别 | INFO |
 | `MAX_CONCURRENT_TASKS_PER_AGENT` | Agent 最大并发任务数 | 3 |
 | `DEFAULT_TASK_TIMEOUT_MINUTES` | 默认任务超时时间 | 120 |
+| `RATE_LIMIT_MAX_REQUESTS` | 速率限制最大请求数 | 100 |
 
 ## 开发指南
 
@@ -146,10 +153,10 @@ reviewing（待验收）
 
 ```bash
 # 检查 postgres 是否运行
-docker-compose ps
+docker compose ps
 
 # 查看 postgres 日志
-docker-compose logs postgres
+docker compose logs postgres
 
 # 重置数据库
 ./scripts/dev-clean.sh --all

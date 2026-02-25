@@ -69,7 +69,14 @@ source ~/.zshrc
 
 ```bash
 cd task-service
-docker-compose up -d
+./scripts/dev.sh start --fresh
+```
+
+或者手动启动：
+
+```bash
+cd task-service
+docker compose up -d
 ```
 
 ### 3. 创建 Agent
