@@ -2,13 +2,13 @@
 Database connection management
 """
 
-import os
-import asyncpg
 import asyncio
-from typing import Optional
+import os
+
+import asyncpg
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/taskmanager")
-_pool: Optional[asyncpg.Pool] = None
+_pool: asyncpg.Pool | None = None
 _pool_lock = asyncio.Lock()
 
 # Connection pool settings

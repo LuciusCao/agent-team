@@ -4,7 +4,8 @@ Security utilities - API Key and Rate Limiting
 
 import os
 from datetime import datetime
-from fastapi import HTTPException, Security, Request
+
+from fastapi import HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 
 API_KEY = os.getenv("API_KEY")
@@ -24,13 +25,13 @@ async def verify_api_key(api_key: str = Security(api_key_header)):
     """
     if API_KEY is None:
         return None
-    
+
     if api_key is None:
         raise HTTPException(status_code=403, detail="API Key required")
-    
+
     if api_key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API Key")
-    
+
     return api_key
 
 
@@ -42,7 +43,7 @@ async def rate_limit(request: Request):
     """
     client_ip = request.client.host
     current_time = datetime.now().timestamp()
-    
+
     # 清理过期的记录
     if client_ip in rate_limit_store:
         rate_limit_store[client_ip] = [
@@ -51,14 +52,14 @@ async def rate_limit(request: Request):
         ]
     else:
         rate_limit_store[client_ip] = []
-    
+
     # 检查是否超过限制
     if len(rate_limit_store[client_ip]) >= RATE_LIMIT_MAX_REQUESTS:
         raise HTTPException(
             status_code=429,
             detail=f"Rate limit exceeded. Max {RATE_LIMIT_MAX_REQUESTS} requests per {RATE_LIMIT_WINDOW} seconds"
         )
-    
+
     # 记录本次请求
     rate_limit_store[client_ip].append(current_time)
     return True

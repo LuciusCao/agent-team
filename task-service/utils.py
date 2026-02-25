@@ -2,14 +2,14 @@
 Task Service 通用工具函数
 """
 
-import os
-import json
 import asyncio
+import json
 import logging
+import os
 import sys
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from datetime import datetime
 from functools import wraps
+
 import asyncpg
 
 logger = logging.getLogger("task_service")
@@ -24,15 +24,15 @@ def setup_logging():
     """
     logger = logging.getLogger("task_service")
     logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
-    
+
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JSONFormatter())
     logger.handlers = [handler]
-    
+
     # 配置 uvicorn 日志
     logging.getLogger("uvicorn").handlers = [handler]
     logging.getLogger("uvicorn.access").handlers = [handler]
-    
+
     return logger
 
 class JSONFormatter(logging.Formatter):
@@ -44,7 +44,7 @@ class JSONFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        
+
         # 添加额外字段
         if hasattr(record, "agent_name"):
             log_obj["agent_name"] = record.agent_name
@@ -58,11 +58,11 @@ class JSONFormatter(logging.Formatter):
             log_obj["duration_ms"] = record.duration_ms
         if hasattr(record, "extra"):
             log_obj.update(record.extra)
-        
+
         # 添加异常信息
         if record.exc_info:
             log_obj["exception"] = self.formatException(record.exc_info)
-        
+
         return json.dumps(log_obj, ensure_ascii=False)
 
 
@@ -103,7 +103,7 @@ def retry_on_db_error(max_retries=3, base_delay=1):
     return decorator
 
 
-async def check_idempotency(conn: asyncpg.Connection, idempotency_key: Optional[str] = None):
+async def check_idempotency(conn: asyncpg.Connection, idempotency_key: str | None = None):
     """检查幂等性（数据库持久化版本）
     
     如果提供了幂等键且已存在（未过期），返回缓存的响应。
@@ -121,7 +121,7 @@ async def check_idempotency(conn: asyncpg.Connection, idempotency_key: Optional[
     """
     if not idempotency_key:
         return None, False
-    
+
     # 检查幂等键是否存在且未过期（24小时内）
     # 不在此处清理过期键，避免竞态条件
     row = await conn.fetchrow(
@@ -130,7 +130,7 @@ async def check_idempotency(conn: asyncpg.Connection, idempotency_key: Optional[
            AND created_at > NOW() - INTERVAL '24 hours'""",
         idempotency_key
     )
-    
+
     if row:
         cached_response = json.loads(row['response'])
         logger.info(
@@ -138,7 +138,7 @@ async def check_idempotency(conn: asyncpg.Connection, idempotency_key: Optional[
             extra={"idempotency_key": idempotency_key, "action": "idempotency_hit"}
         )
         return cached_response, True
-    
+
     return None, False
 
 
@@ -161,7 +161,7 @@ async def cleanup_expired_idempotency_keys(conn: asyncpg.Connection) -> int:
         count = int(result.split()[1]) if result.split() else 0
     except (IndexError, ValueError):
         count = 0
-    
+
     if count > 0:
         logger.info(
             f"Cleaned up {count} expired idempotency keys",
@@ -170,7 +170,7 @@ async def cleanup_expired_idempotency_keys(conn: asyncpg.Connection) -> int:
     return count
 
 
-async def store_idempotency_response(conn: asyncpg.Connection, idempotency_key: Optional[str], response: Dict):
+async def store_idempotency_response(conn: asyncpg.Connection, idempotency_key: str | None, response: dict):
     """存储幂等响应（数据库持久化版本）
     
     Args:
@@ -208,9 +208,9 @@ async def check_dependencies(conn: asyncpg.Connection, task_id: int) -> tuple[bo
     task = await conn.fetchrow("SELECT dependencies FROM tasks WHERE id = $1", task_id)
     if not task or not task["dependencies"]:
         return True, []
-    
+
     deps = task["dependencies"]
-    
+
     # 检查所有依赖任务是否完成
     for dep_id in deps:
         dep = await conn.fetchrow(
@@ -219,7 +219,7 @@ async def check_dependencies(conn: asyncpg.Connection, task_id: int) -> tuple[bo
         )
         if not dep or dep["status"] != "completed":
             return False, deps
-    
+
     return True, []
 
 
@@ -233,25 +233,26 @@ def validate_task_dependencies(tasks: list) -> None:
         HTTPException: 如果检测到循环依赖或无效依赖
     """
     from collections import defaultdict, deque
+
     from fastapi import HTTPException
-    
+
     n = len(tasks)
     graph = defaultdict(list)
     in_degree = [0] * n
-    
+
     for i, task in enumerate(tasks):
         if task.dependencies:
             for dep_idx in task.dependencies:
                 if dep_idx < 0 or dep_idx >= n:
                     raise HTTPException(status_code=400, detail=f"Invalid dependency index: {dep_idx}")
                 if dep_idx == i:
-                    raise HTTPException(status_code=400, detail=f"Task cannot depend on itself")
+                    raise HTTPException(status_code=400, detail="Task cannot depend on itself")
                 graph[dep_idx].append(i)
                 in_degree[i] += 1
-    
+
     queue = deque([i for i in range(n) if in_degree[i] == 0])
     visited = 0
-    
+
     while queue:
         node = queue.popleft()
         visited += 1
@@ -259,7 +260,7 @@ def validate_task_dependencies(tasks: list) -> None:
             in_degree[neighbor] -= 1
             if in_degree[neighbor] == 0:
                 queue.append(neighbor)
-    
+
     if visited != n:
         raise HTTPException(status_code=400, detail="Circular dependency detected")
 
@@ -288,7 +289,7 @@ async def update_agent_status_after_task_change(conn: asyncpg.Connection, agent_
         """,
         agent_name
     )
-    
+
     if other_tasks['count'] == 0:
         # 没有其他任务了，设为 online
         await conn.execute(
@@ -351,8 +352,8 @@ async def log_task_action(
     conn: asyncpg.Connection,
     task_id: int,
     action: str,
-    old_status: Optional[str] = None,
-    new_status: Optional[str] = None,
+    old_status: str | None = None,
+    new_status: str | None = None,
     message: str = "",
     actor: str = "system"
 ):
@@ -386,7 +387,7 @@ def log_structured(level: str, message: str, **kwargs):
     """
     extra = {"action": kwargs.pop("action", "unknown")}
     extra.update(kwargs)
-    
+
     log_func = getattr(logger, level.lower(), logger.info)
     log_func(message, extra=extra)
 
@@ -398,12 +399,12 @@ class RateLimiter:
     
     注意：生产环境建议使用 Redis 实现分布式限流
     """
-    
+
     def __init__(self, window: int = 60, max_requests: int = 100):
         self.window = window
         self.max_requests = max_requests
         self.store = {}
-    
+
     def is_allowed(self, key: str) -> bool:
         """检查是否允许请求
         
@@ -414,7 +415,7 @@ class RateLimiter:
             bool: 是否允许
         """
         current_time = datetime.now().timestamp()
-        
+
         # 清理过期记录
         if key in self.store:
             self.store[key] = [
@@ -423,15 +424,15 @@ class RateLimiter:
             ]
         else:
             self.store[key] = []
-        
+
         # 检查是否超过限制
         if len(self.store[key]) >= self.max_requests:
             return False
-        
+
         # 记录本次请求
         self.store[key].append(current_time)
         return True
-    
+
     def get_remaining(self, key: str) -> int:
         """获取剩余请求数
         
@@ -442,16 +443,16 @@ class RateLimiter:
             int: 剩余请求数
         """
         current_time = datetime.now().timestamp()
-        
+
         if key not in self.store:
             return self.max_requests
-        
+
         # 清理过期记录
         valid_requests = [
             ts for ts in self.store[key]
             if current_time - ts < self.window
         ]
-        
+
         return max(0, self.max_requests - len(valid_requests))
 
 
@@ -489,7 +490,7 @@ def validate_agent_role(role: str) -> bool:
     return role in valid_roles
 
 
-def sanitize_string(value: Optional[str], max_length: int = 255) -> Optional[str]:
+def sanitize_string(value: str | None, max_length: int = 255) -> str | None:
     """清理字符串输入
     
     Args:
@@ -501,12 +502,12 @@ def sanitize_string(value: Optional[str], max_length: int = 255) -> Optional[str
     """
     if value is None:
         return None
-    
+
     # 去除首尾空白
     value = value.strip()
-    
+
     # 截断过长字符串
     if len(value) > max_length:
         value = value[:max_length]
-    
+
     return value

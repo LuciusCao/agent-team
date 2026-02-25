@@ -2,18 +2,19 @@
 Task Management Service - Main Application
 """
 
-import os
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime
-from typing import Optional, Dict, Any
-from fastapi import FastAPI, Request, Depends, HTTPException
+from typing import Any
+
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from database import get_db
+from routers import agents, channels, dashboard, projects, tasks
 from security import rate_limit
-from routers import projects, tasks, agents, dashboard, channels
 
 # Import utilities
 from utils import setup_logging
@@ -28,7 +29,7 @@ logger = logging.getLogger("task_service")
 SENSITIVE_FIELDS = {'api_key', 'token', 'password', 'secret', 'authorization', 'x-api-key'}
 
 
-def sanitize_log_data(data: Dict[str, Any]) -> Dict[str, Any]:
+def sanitize_log_data(data: dict[str, Any]) -> dict[str, Any]:
     """清理日志数据中的敏感信息
     
     Args:
@@ -39,7 +40,7 @@ def sanitize_log_data(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(data, dict):
         return data
-    
+
     sanitized = {}
     for key, value in data.items():
         if key.lower() in SENSITIVE_FIELDS:
@@ -56,7 +57,11 @@ def sanitize_log_data(data: Dict[str, Any]) -> Dict[str, Any]:
 
 # ============ FastAPI App ============
 
-app = FastAPI(title="Task Management Service", version="1.2.0")
+app = FastAPI(
+    title="Task Management Service",
+    version="1.2.0",
+    redirect_slashes=False  # 禁用自动重定向，允许不带斜杠的 URL
+)
 
 # CORS 配置
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
@@ -82,11 +87,11 @@ async def log_requests(request: Request, call_next):
     """请求日志中间件（带敏感信息过滤）"""
     start_time = time.time()
     client_ip = request.client.host if request.client else "unknown"
-    
+
     try:
         response = await call_next(request)
         duration_ms = (time.time() - start_time) * 1000
-        
+
         log_data = {
             "method": request.method,
             "path": request.url.path,
@@ -95,10 +100,10 @@ async def log_requests(request: Request, call_next):
             "client_ip": client_ip,
             "action": "http_request"
         }
-        
+
         # 清理敏感信息
         safe_log_data = sanitize_log_data(log_data)
-        
+
         logger.info(
             f"{request.method} {request.url.path} - {response.status_code} - {duration_ms:.2f}ms",
             extra=safe_log_data
@@ -106,7 +111,7 @@ async def log_requests(request: Request, call_next):
         return response
     except Exception as e:
         duration_ms = (time.time() - start_time) * 1000
-        
+
         log_data = {
             "method": request.method,
             "path": request.url.path,
@@ -115,10 +120,10 @@ async def log_requests(request: Request, call_next):
             "error": str(e),
             "action": "http_request_error"
         }
-        
+
         # 清理敏感信息
         safe_log_data = sanitize_log_data(log_data)
-        
+
         logger.error(
             f"{request.method} {request.url.path} - ERROR - {duration_ms:.2f}ms",
             extra=safe_log_data,
@@ -148,9 +153,9 @@ async def health_check(db=Depends(get_db)):
     except Exception as e:
         logger.error(f"Health check failed: {e}", extra={"action": "health_check_failed"})
         raise HTTPException(status_code=503, detail=f"Database connection failed: {e}")
-    
+
     uptime = (datetime.utcnow() - _start_time).total_seconds()
-    
+
     return {
         "status": "healthy",
         "version": "1.2.0",

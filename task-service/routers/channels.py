@@ -5,8 +5,8 @@ Channels API Router
 from fastapi import APIRouter, Depends
 
 from database import get_db
-from security import verify_api_key, rate_limit
 from models import AgentChannel
+from security import rate_limit, verify_api_key
 
 router = APIRouter()
 channels_router = APIRouter()
@@ -25,7 +25,7 @@ async def register_agent_channel(ac: AgentChannel, db=Depends(get_db)):
                 """,
                 ac.agent_name
             )
-        
+
         result = await conn.fetchrow(
             """
             INSERT INTO agent_channels (agent_name, channel_id, last_seen)
