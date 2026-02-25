@@ -89,6 +89,7 @@ async def stuck_task_monitor():
                     FROM tasks t
                     LEFT JOIN task_type_defaults ttd ON t.task_type = ttd.task_type
                     WHERE t.status = 'running'
+                    AND t.deleted_at IS NULL
                     AND t.started_at < NOW() - (
                         COALESCE(
                             t.timeout_minutes,
@@ -147,3 +148,37 @@ async def stuck_task_monitor():
         except Exception as e:
             # 其他错误，记录但不重置连接池
             logger.error(f"Stuck task monitor unexpected error: {e}", exc_info=True)
+
+
+async def soft_delete_cleanup_monitor():
+    """定期清理超过保留期的软删除记录"""
+    CLEANUP_INTERVAL_SECONDS = 86400  # 每天运行一次
+    RETENTION_DAYS = 30  # 保留30天
+
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        try:
+            from utils import cleanup_soft_deleted
+
+            pool = await get_pool()
+
+            async with pool.acquire() as conn:
+                total_cleaned = 0
+                for table in ['tasks', 'agents', 'projects']:
+                    count = await cleanup_soft_deleted(conn, table, RETENTION_DAYS)
+                    total_cleaned += count
+
+                if total_cleaned > 0:
+                    logger.info(
+                        f"Soft delete cleanup completed: {total_cleaned} records permanently deleted",
+                        extra={"action": "soft_delete_cleanup", "total_cleaned": total_cleaned}
+                    )
+
+            _reset_error_count("soft_delete_cleanup")
+
+        except (asyncpg.PostgresError, asyncpg.ConnectionDoesNotExistError, OSError) as e:
+            logger.error(f"Soft delete cleanup DB error: {e}", exc_info=True)
+            if _should_reset_pool("soft_delete_cleanup"):
+                await reset_pool()
+        except Exception as e:
+            logger.error(f"Soft delete cleanup unexpected error: {e}", exc_info=True)

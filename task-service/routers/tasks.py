@@ -14,6 +14,8 @@ from utils import (
     check_dependencies,
     check_idempotency,
     log_task_action,
+    restore_soft_deleted,
+    soft_delete,
     store_idempotency_response,
     update_agent_status_after_task_change,
     validate_task_dependencies_for_create,
@@ -79,7 +81,7 @@ async def list_tasks(
         params.append(tags)
         conditions.append(f"task_tags && ${len(params)}")
 
-    query = f"SELECT * FROM tasks WHERE {' AND '.join(conditions)} ORDER BY priority DESC, created_at DESC"
+    query = f"SELECT * FROM tasks WHERE {' AND '.join(conditions)} AND deleted_at IS NULL ORDER BY priority DESC, created_at DESC"
 
     async with db.acquire() as conn:
         results = await conn.fetch(query, *params)
@@ -92,14 +94,16 @@ async def get_available_tasks(db=Depends(get_db)):
     async with db.acquire() as conn:
         results = await conn.fetch(
             """
-            SELECT t.* 
+            SELECT t.*
             FROM tasks t
-            WHERE t.status = 'pending' 
+            WHERE t.status = 'pending'
             AND t.assignee_agent IS NULL
+            AND t.deleted_at IS NULL
             AND NOT EXISTS (
-                SELECT 1 FROM tasks dep 
-                WHERE dep.id = ANY(t.dependencies) 
+                SELECT 1 FROM tasks dep
+                WHERE dep.id = ANY(t.dependencies)
                 AND dep.status != 'completed'
+                AND dep.deleted_at IS NULL
             )
             ORDER BY t.priority DESC, t.created_at ASC
             """
@@ -124,15 +128,17 @@ async def get_available_tasks_for_agent(
         if skill_match and agent_skills:
             results = await conn.fetch(
                 """
-                SELECT t.* 
+                SELECT t.*
                 FROM tasks t
-                WHERE t.status = 'pending' 
+                WHERE t.status = 'pending'
                 AND t.assignee_agent IS NULL
+                AND t.deleted_at IS NULL
                 AND t.task_tags && $1
                 AND NOT EXISTS (
-                    SELECT 1 FROM tasks dep 
-                    WHERE dep.id = ANY(t.dependencies) 
+                    SELECT 1 FROM tasks dep
+                    WHERE dep.id = ANY(t.dependencies)
                     AND dep.status != 'completed'
+                    AND dep.deleted_at IS NULL
                 )
                 ORDER BY t.priority DESC, t.created_at ASC
                 """,
@@ -141,14 +147,16 @@ async def get_available_tasks_for_agent(
         else:
             results = await conn.fetch(
                 """
-                SELECT t.* 
+                SELECT t.*
                 FROM tasks t
-                WHERE t.status = 'pending' 
+                WHERE t.status = 'pending'
                 AND t.assignee_agent IS NULL
+                AND t.deleted_at IS NULL
                 AND NOT EXISTS (
-                    SELECT 1 FROM tasks dep 
-                    WHERE dep.id = ANY(t.dependencies) 
+                    SELECT 1 FROM tasks dep
+                    WHERE dep.id = ANY(t.dependencies)
                     AND dep.status != 'completed'
+                    AND dep.deleted_at IS NULL
                 )
                 ORDER BY t.priority DESC, t.created_at ASC
                 """
@@ -434,7 +442,7 @@ async def retry_task(
 @router.get("/{task_id}", dependencies=[Depends(rate_limit)])
 async def get_task(task_id: int, db=Depends(get_db)):
     async with db.acquire() as conn:
-        task = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+        task = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1 AND deleted_at IS NULL", task_id)
         logs = await conn.fetch(
             "SELECT * FROM task_logs WHERE task_id = $1 ORDER BY created_at DESC",
             task_id
@@ -448,7 +456,7 @@ async def get_task(task_id: int, db=Depends(get_db)):
 async def update_task(task_id: int, update: TaskUpdate, db=Depends(get_db)):
     async with db.acquire() as conn:
         async with conn.transaction():
-            current = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+            current = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1 AND deleted_at IS NULL", task_id)
             if not current:
                 raise HTTPException(status_code=404, detail="Task not found")
 
@@ -518,7 +526,7 @@ async def update_task(task_id: int, update: TaskUpdate, db=Depends(get_db)):
             updates.append("updated_at = NOW()")
             params.append(task_id)
 
-            query = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ${param_num} RETURNING *"
+            query = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ${param_num} AND deleted_at IS NULL RETURNING *"
 
             result = await conn.fetchrow(query, *params)
 
@@ -550,7 +558,7 @@ async def review_task(
             if should_skip:
                 return cached
 
-            task = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+            task = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1 AND deleted_at IS NULL", task_id)
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
 
@@ -576,7 +584,7 @@ async def review_task(
                     await conn.execute(
                         """
                         UPDATE agents
-                        SET failed_tasks = failed_tasks + 1,
+                            SET failed_tasks = failed_tasks + 1,
                             updated_at = NOW()
                         WHERE name = $1
                         """,
@@ -588,7 +596,7 @@ async def review_task(
                 """
                 UPDATE tasks SET status = $1, feedback = $2, updated_at = NOW(),
                     completed_at = CASE WHEN $1::varchar = 'completed' THEN NOW() ELSE NULL END
-                WHERE id = $3
+                WHERE id = $3 AND deleted_at IS NULL
                 """,
                 new_status, review.feedback, task_id
             )
@@ -606,3 +614,37 @@ async def review_task(
             await store_idempotency_response(conn, idempotency_key, response)
 
     return updated
+
+
+@router.delete("/{task_id}", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
+async def delete_task(
+    task_id: int,
+    hard: bool = False,
+    db=Depends(get_db)
+):
+    """删除任务（默认软删除，hard=true 时物理删除）"""
+    async with db.acquire() as conn:
+        if hard:
+            # 物理删除
+            from utils import hard_delete
+            success = await hard_delete(conn, "tasks", task_id)
+        else:
+            # 软删除
+            success = await soft_delete(conn, "tasks", task_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Task not found or already deleted")
+
+    return {"message": f"Task {task_id} {'hard ' if hard else ''}deleted successfully"}
+
+
+@router.post("/{task_id}/restore", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
+async def restore_task(task_id: int, db=Depends(get_db)):
+    """恢复软删除的任务"""
+    async with db.acquire() as conn:
+        success = await restore_soft_deleted(conn, "tasks", task_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Task not found or not deleted")
+
+    return {"message": f"Task {task_id} restored successfully"}

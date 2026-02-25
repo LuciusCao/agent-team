@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from database import get_db
 from models import ProjectCreate, TaskCreate
 from security import rate_limit, verify_api_key
-from utils import validate_task_dependencies
+from utils import hard_delete, restore_soft_deleted, soft_delete, validate_task_dependencies
 
 router = APIRouter()
 
@@ -32,18 +32,18 @@ async def list_projects(status: str | None = None, db=Depends(get_db)):
     async with db.acquire() as conn:
         if status:
             results = await conn.fetch(
-                "SELECT * FROM projects WHERE status = $1 ORDER BY created_at DESC",
+                "SELECT * FROM projects WHERE status = $1 AND deleted_at IS NULL ORDER BY created_at DESC",
                 status
             )
         else:
-            results = await conn.fetch("SELECT * FROM projects ORDER BY created_at DESC")
+            results = await conn.fetch("SELECT * FROM projects WHERE deleted_at IS NULL ORDER BY created_at DESC")
     return results
 
 
 @router.get("/{project_id}", dependencies=[Depends(rate_limit)])
 async def get_project(project_id: int, db=Depends(get_db)):
     async with db.acquire() as conn:
-        project = await conn.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
+        project = await conn.fetchrow("SELECT * FROM projects WHERE id = $1 AND deleted_at IS NULL", project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
@@ -53,13 +53,13 @@ async def get_project(project_id: int, db=Depends(get_db)):
 async def get_project_progress(project_id: int, db=Depends(get_db)):
     """获取项目进度统计"""
     async with db.acquire() as conn:
-        project = await conn.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
+        project = await conn.fetchrow("SELECT * FROM projects WHERE id = $1 AND deleted_at IS NULL", project_id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
         stats = await conn.fetchrow(
             """
-            SELECT 
+            SELECT
                 COUNT(*) as total,
                 COUNT(*) FILTER (WHERE status = 'pending') as pending,
                 COUNT(*) FILTER (WHERE status = 'assigned') as assigned,
@@ -68,7 +68,7 @@ async def get_project_progress(project_id: int, db=Depends(get_db)):
                 COUNT(*) FILTER (WHERE status = 'completed') as completed,
                 COUNT(*) FILTER (WHERE status = 'failed') as failed,
                 COUNT(*) FILTER (WHERE status = 'rejected') as rejected
-            FROM tasks WHERE project_id = $1
+            FROM tasks WHERE project_id = $1 AND deleted_at IS NULL
             """,
             project_id
         )
@@ -92,7 +92,7 @@ async def breakdown_project(project_id: int, tasks: list[TaskCreate], db=Depends
     validate_task_dependencies(tasks)
 
     async with db.acquire() as conn:
-        project = await conn.fetchrow("SELECT * FROM projects WHERE id = $1", project_id)
+        project = await conn.fetchrow("SELECT * FROM projects WHERE id = $1 AND deleted_at IS NULL", project_id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
@@ -127,7 +127,34 @@ async def breakdown_project(project_id: int, tasks: list[TaskCreate], db=Depends
 async def get_project_tasks(project_id: int, db=Depends(get_db)):
     async with db.acquire() as conn:
         results = await conn.fetch(
-            "SELECT * FROM tasks WHERE project_id = $1 ORDER BY priority DESC, created_at DESC",
+            "SELECT * FROM tasks WHERE project_id = $1 AND deleted_at IS NULL ORDER BY priority DESC, created_at DESC",
             project_id
         )
     return results
+
+
+@router.delete("/{project_id}", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
+async def delete_project(project_id: int, hard: bool = False, db=Depends(get_db)):
+    """删除项目（默认软删除，hard=true 时物理删除）"""
+    async with db.acquire() as conn:
+        if hard:
+            success = await hard_delete(conn, "projects", project_id)
+        else:
+            success = await soft_delete(conn, "projects", project_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Project not found or already deleted")
+
+    return {"message": f"Project {project_id} {'hard ' if hard else ''}deleted successfully"}
+
+
+@router.post("/{project_id}/restore", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
+async def restore_project(project_id: int, db=Depends(get_db)):
+    """恢复软删除的项目"""
+    async with db.acquire() as conn:
+        success = await restore_soft_deleted(conn, "projects", project_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Project not found or not deleted")
+
+    return {"message": f"Project {project_id} restored successfully"}

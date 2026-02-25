@@ -570,3 +570,144 @@ def sanitize_string(value: str | None, max_length: int = 255) -> str | None:
         value = value[:max_length]
 
     return value
+
+
+# ============ Soft Delete Utilities ============
+
+SOFT_DELETE_TABLES = {'tasks', 'agents', 'projects'}
+
+
+async def soft_delete(conn: asyncpg.Connection, table: str, id_value: int, id_column: str = 'id') -> bool:
+    """软删除记录
+
+    Args:
+        conn: 数据库连接
+        table: 表名
+        id_value: 记录ID
+        id_column: ID列名，默认为 'id'
+
+    Returns:
+        bool: 是否成功删除
+
+    Raises:
+        ValueError: 如果表名不在允许列表中
+    """
+    if table not in SOFT_DELETE_TABLES:
+        raise ValueError(f"Table {table} does not support soft delete")
+
+    result = await conn.execute(
+        f"""
+        UPDATE {table}
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE {id_column} = $1 AND deleted_at IS NULL
+        """,
+        id_value
+    )
+
+    # 解析结果，格式类似 "UPDATE 1"
+    try:
+        count = int(result.split()[1]) if result.split() else 0
+    except (IndexError, ValueError):
+        count = 0
+
+    return count > 0
+
+
+async def restore_soft_deleted(conn: asyncpg.Connection, table: str, id_value: int, id_column: str = 'id') -> bool:
+    """恢复软删除的记录
+
+    Args:
+        conn: 数据库连接
+        table: 表名
+        id_value: 记录ID
+        id_column: ID列名，默认为 'id'
+
+    Returns:
+        bool: 是否成功恢复
+
+    Raises:
+        ValueError: 如果表名不在允许列表中
+    """
+    if table not in SOFT_DELETE_TABLES:
+        raise ValueError(f"Table {table} does not support soft delete")
+
+    result = await conn.execute(
+        f"""
+        UPDATE {table}
+        SET deleted_at = NULL, updated_at = NOW()
+        WHERE {id_column} = $1 AND deleted_at IS NOT NULL
+        """,
+        id_value
+    )
+
+    try:
+        count = int(result.split()[1]) if result.split() else 0
+    except (IndexError, ValueError):
+        count = 0
+
+    return count > 0
+
+
+async def hard_delete(conn: asyncpg.Connection, table: str, id_value: int, id_column: str = 'id') -> bool:
+    """物理删除记录（谨慎使用）
+
+    Args:
+        conn: 数据库连接
+        table: 表名
+        id_value: 记录ID
+        id_column: ID列名，默认为 'id'
+
+    Returns:
+        bool: 是否成功删除
+    """
+    result = await conn.execute(
+        f"DELETE FROM {table} WHERE {id_column} = $1",
+        id_value
+    )
+
+    try:
+        count = int(result.split()[1]) if result.split() else 0
+    except (IndexError, ValueError):
+        count = 0
+
+    return count > 0
+
+
+async def cleanup_soft_deleted(
+    conn: asyncpg.Connection,
+    table: str,
+    days: int = 30
+) -> int:
+    """清理超过指定天数的软删除记录
+
+    Args:
+        conn: 数据库连接
+        table: 表名
+        days: 保留天数，默认30天
+
+    Returns:
+        int: 清理的记录数
+    """
+    if table not in SOFT_DELETE_TABLES:
+        raise ValueError(f"Table {table} does not support soft delete")
+
+    result = await conn.execute(
+        f"""
+        DELETE FROM {table}
+        WHERE deleted_at IS NOT NULL
+        AND deleted_at < NOW() - INTERVAL '{days} days'
+        """
+    )
+
+    try:
+        count = int(result.split()[1]) if result.split() else 0
+    except (IndexError, ValueError):
+        count = 0
+
+    if count > 0:
+        logger.info(
+            f"Cleaned up {count} soft-deleted records from {table}",
+            extra={"action": "soft_delete_cleanup", "table": table, "count": count}
+        )
+
+    return count
