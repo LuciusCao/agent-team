@@ -147,7 +147,7 @@ async def get_available_tasks_for_agent(
     return [dict(row) for row in results]
 
 
-@router.post("/{task_id}/claim", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
+@router.post("/{task_id}/claim/", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def claim_task(
     task_id: int, 
     agent_name: str, 
@@ -213,7 +213,7 @@ async def claim_task(
     return result
 
 
-@router.post("/{task_id}/start", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
+@router.post("/{task_id}/start/", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def start_task(
     task_id: int, 
     agent_name: str, 
@@ -269,7 +269,7 @@ async def start_task(
     return result
 
 
-@router.post("/{task_id}/submit", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
+@router.post("/{task_id}/submit/", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def submit_task(
     task_id: int, 
     agent_name: str, 
@@ -313,7 +313,7 @@ async def submit_task(
     return updated
 
 
-@router.post("/{task_id}/release", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
+@router.post("/{task_id}/release/", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def release_task(
     task_id: int, 
     agent_name: str, 
@@ -360,7 +360,7 @@ async def release_task(
     return result
 
 
-@router.post("/{task_id}/retry", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
+@router.post("/{task_id}/retry/", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def retry_task(
     task_id: int, 
     idempotency_key: Optional[str] = None,
@@ -507,7 +507,7 @@ async def update_task(task_id: int, update: TaskUpdate, db=Depends(get_db)):
     return result
 
 
-@router.post("/{task_id}/review", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
+@router.post("/{task_id}/review/", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def review_task(
     task_id: int, 
     review: TaskReview, 
@@ -558,7 +558,8 @@ async def review_task(
         
         await conn.execute(
             """
-            UPDATE tasks SET status = $1, feedback = $2, updated_at = NOW(), completed_at = CASE WHEN $1 = 'completed' THEN NOW() ELSE NULL END
+            UPDATE tasks SET status = $1, feedback = $2, updated_at = NOW(), 
+                completed_at = CASE WHEN $1::varchar = 'completed' THEN NOW() ELSE NULL END
             WHERE id = $3
             """,
             new_status, review.feedback, task_id

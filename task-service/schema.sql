@@ -99,7 +99,8 @@ CREATE TABLE IF NOT EXISTS agents (
     current_task_id INTEGER,
     
     last_heartbeat TIMESTAMP,
-    created_at TIMESTAMP DEFAULT NOW()
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
 );
 
 -- Agent 活跃频道表

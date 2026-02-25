@@ -13,7 +13,7 @@ from models import AgentRegister, AgentHeartbeat
 router = APIRouter()
 
 
-@router.post("/register", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
+@router.post("/register/", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def register_agent(agent: AgentRegister, db=Depends(get_db)):
     async with db.acquire() as conn:
         result = await conn.fetchrow(
@@ -36,7 +36,7 @@ async def register_agent(agent: AgentRegister, db=Depends(get_db)):
     return result
 
 
-@router.post("/{name}/heartbeat", dependencies=[Depends(rate_limit)])
+@router.post("/{name}/heartbeat/", dependencies=[Depends(rate_limit)])
 async def agent_heartbeat(name: str, data: AgentHeartbeat, db=Depends(get_db)):
     async with db.acquire() as conn:
         result = await conn.fetchrow(
@@ -85,7 +85,7 @@ async def unregister_agent(name: str, db=Depends(get_db)):
     return {"message": f"Agent {name} unregistered"}
 
 
-@router.get("/{name}/channels", dependencies=[Depends(rate_limit)])
+@router.get("/{name}/channels/", dependencies=[Depends(rate_limit)])
 async def get_agent_channels(name: str, db=Depends(get_db)):
     async with db.acquire() as conn:
         results = await conn.fetch(

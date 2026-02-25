@@ -56,7 +56,11 @@ def sanitize_log_data(data: Dict[str, Any]) -> Dict[str, Any]:
 
 # ============ FastAPI App ============
 
-app = FastAPI(title="Task Management Service", version="1.2.0")
+app = FastAPI(
+    title="Task Management Service",
+    version="1.2.0",
+    redirect_slashes=False  # 禁用自动重定向，允许不带斜杠的 URL
+)
 
 # CORS 配置
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
