@@ -8,7 +8,7 @@ agents/*
 .DS_Store
 
 # 忽略开发文档（不应提交到代码库）
-REVIEW.md
+REVIEW_*.md
 discord_bot_setup*
 
 # 忽略 Python 缓存
