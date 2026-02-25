@@ -4,7 +4,6 @@ Task Management Service - Main Application
 
 import asyncio
 import logging
-import os
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -12,6 +11,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
+from config import Config
 from database import get_db
 from routers import agents, channels, dashboard, projects, tasks
 from security import rate_limit
@@ -31,27 +31,75 @@ SENSITIVE_FIELDS = {'api_key', 'token', 'password', 'secret', 'authorization', '
 
 def sanitize_log_data(data: dict[str, Any]) -> dict[str, Any]:
     """清理日志数据中的敏感信息
-    
+
+    递归检查所有字符串值，检测并脱敏敏感信息。
+
     Args:
         data: 原始日志数据
-        
+
     Returns:
-        清理后的数据，敏感字段替换为 ***
+        清理后的数据，敏感字段和敏感值替换为 ***
     """
     if not isinstance(data, dict):
         return data
 
+    def is_sensitive_key(key: str) -> bool:
+        """检查 key 是否包含敏感字段名"""
+        return any(sf in key.lower() for sf in SENSITIVE_FIELDS)
+
+    def mask_sensitive_value(value: str) -> str:
+        """脱敏敏感值"""
+        if len(value) <= 3:
+            return "***"
+        return value[:3] + "***"
+
+    def contains_sensitive_pattern(value: str) -> tuple[bool, list[str]]:
+        """检查字符串值是否包含敏感模式（如密码、token 等）
+
+        Returns:
+            tuple: (是否包含敏感模式, 匹配到的模式列表)
+        """
+        patterns = [
+            r"password\s*[=:]\s*\S+",
+            r"token\s*[=:]\s*\S+",
+            r"api[_-]?key\s*[=:]\s*\S+",
+            r"secret\s*[=:]\s*\S+",
+            r"authorization\s*[=:]\s*\S+",
+        ]
+        import re
+        matched = [p for p in patterns if re.search(p, value, re.IGNORECASE)]
+        return bool(matched), matched
+
+    def sanitize_value(key: str, value: Any) -> Any:
+        """递归脱敏值"""
+        if isinstance(value, dict):
+            return {k: sanitize_value(k, v) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [sanitize_value(key, item) for item in value]
+        elif isinstance(value, str):
+            # 如果 key 是敏感字段，脱敏整个值
+            if is_sensitive_key(key):
+                return mask_sensitive_value(value)
+            # 如果值包含敏感模式，尝试脱敏
+            has_sensitive, patterns = contains_sensitive_pattern(value)
+            if has_sensitive:
+                import re
+                result = value
+                for pattern in patterns:
+                    result = re.sub(
+                        pattern,
+                        lambda m: m.group(0).split("=")[0] + "=***" if "=" in m.group(0) else m.group(0).split(":")[0] + ":***",
+                        result,
+                        flags=re.IGNORECASE
+                    )
+                return result
+            return value
+        return value
+
     sanitized = {}
     for key, value in data.items():
-        if key.lower() in SENSITIVE_FIELDS:
-            sanitized[key] = '***'
-        elif isinstance(value, dict):
-            sanitized[key] = sanitize_log_data(value)
-        elif isinstance(value, str) and any(sf in key.lower() for sf in SENSITIVE_FIELDS):
-            # 如果 key 包含敏感字段名，也进行脱敏
-            sanitized[key] = value[:3] + '***' if len(value) > 3 else '***'
-        else:
-            sanitized[key] = value
+        sanitized[key] = sanitize_value(key, value)
+
     return sanitized
 
 
@@ -64,17 +112,16 @@ app = FastAPI(
 )
 
 # CORS 配置
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
-if CORS_ORIGINS == "*":
+if Config.CORS_ORIGINS == "*":
     logger.warning("CORS is configured to allow all origins. This is insecure for production.")
     allow_origins = ["*"]
 else:
-    allow_origins = [origin.strip() for origin in CORS_ORIGINS.split(",")]
+    allow_origins = [origin.strip() for origin in Config.CORS_ORIGINS.split(",")]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
-    allow_credentials=CORS_ORIGINS != "*",
+    allow_credentials=Config.CORS_ORIGINS != "*",
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
@@ -167,12 +214,21 @@ async def health_check(db=Depends(get_db)):
 
 # ============ Include Routers ============
 
-app.include_router(projects.router, prefix="/projects", tags=["projects"])
-app.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
-app.include_router(agents.router, prefix="/agents", tags=["agents"])
-app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
-app.include_router(channels.router, prefix="/agent-channels", tags=["channels"])
-app.include_router(channels.channels_router, prefix="/channels", tags=["channels"])
+# API v1 路由
+app.include_router(projects.router, prefix="/v1/projects", tags=["projects"])
+app.include_router(tasks.router, prefix="/v1/tasks", tags=["tasks"])
+app.include_router(agents.router, prefix="/v1/agents", tags=["agents"])
+app.include_router(dashboard.router, prefix="/v1/dashboard", tags=["dashboard"])
+app.include_router(channels.router, prefix="/v1/agent-channels", tags=["channels"])
+app.include_router(channels.channels_router, prefix="/v1/channels", tags=["channels"])
+
+# 向后兼容：保留无版本前缀的路由（deprecated）
+app.include_router(projects.router, prefix="/projects", tags=["projects (deprecated)"], deprecated=True)
+app.include_router(tasks.router, prefix="/tasks", tags=["tasks (deprecated)"], deprecated=True)
+app.include_router(agents.router, prefix="/agents", tags=["agents (deprecated)"], deprecated=True)
+app.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard (deprecated)"], deprecated=True)
+app.include_router(channels.router, prefix="/agent-channels", tags=["channels (deprecated)"], deprecated=True)
+app.include_router(channels.channels_router, prefix="/channels", tags=["channels (deprecated)"], deprecated=True)
 
 
 # ============ Background Tasks ============

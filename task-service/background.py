@@ -4,53 +4,82 @@ Background tasks for monitoring and maintenance
 
 import asyncio
 import logging
-import os
 
+import asyncpg
+
+from config import Config
 from database import get_pool, reset_pool
 from utils import update_agent_status_after_task_change
 
 logger = logging.getLogger("task_service")
 
-# Constants
-HEARTBEAT_INTERVAL_SECONDS = 60
-STUCK_TASK_CHECK_INTERVAL_SECONDS = 600
-AGENT_OFFLINE_THRESHOLD_MINUTES = 5
+# 错误计数器，用于控制 reset_pool 频率
+_error_counts = {
+    "heartbeat": 0,
+    "stuck_task": 0
+}
+_MAX_ERRORS_BEFORE_RESET = 3
+
+
+def _should_reset_pool(monitor_name: str) -> bool:
+    """判断是否应该重置连接池
+
+    使用错误计数器避免频繁重置连接池。
+    """
+    _error_counts[monitor_name] += 1
+    if _error_counts[monitor_name] >= _MAX_ERRORS_BEFORE_RESET:
+        _error_counts[monitor_name] = 0
+        return True
+    return False
+
+
+def _reset_error_count(monitor_name: str):
+    """重置错误计数器（当操作成功时调用）"""
+    _error_counts[monitor_name] = 0
 
 
 async def heartbeat_monitor():
     """监控 Agent 心跳，超时设为 offline"""
     while True:
-        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+        await asyncio.sleep(Config.HEARTBEAT_INTERVAL_SECONDS)
         try:
             pool = await get_pool()
 
             async with pool.acquire() as conn:
                 await conn.execute(
                     """
-                    UPDATE agents 
+                    UPDATE agents
                     SET status = 'offline'
-                    WHERE status IN ('online', 'busy') 
+                    WHERE status IN ('online', 'busy')
                     AND last_heartbeat < NOW() - INTERVAL '%s minutes'
-                    """ % AGENT_OFFLINE_THRESHOLD_MINUTES
+                    """ % Config.AGENT_OFFLINE_THRESHOLD_MINUTES
                 )
+
+            # 成功执行，重置错误计数
+            _reset_error_count("heartbeat")
+
+        except (asyncpg.PostgresError, asyncpg.ConnectionDoesNotExistError, OSError) as e:
+            # 数据库相关错误，考虑重置连接池
+            logger.error(f"Heartbeat monitor DB error: {e}", exc_info=True)
+            if _should_reset_pool("heartbeat"):
+                logger.warning("Resetting connection pool due to repeated DB errors")
+                await reset_pool()
         except Exception as e:
-            logger.error(f"Heartbeat monitor error: {e}", exc_info=True)
-            await reset_pool()
+            # 其他错误，记录但不重置连接池
+            logger.error(f"Heartbeat monitor unexpected error: {e}", exc_info=True)
 
 
 async def stuck_task_monitor():
     """监控卡住的任务，自动释放"""
-    DEFAULT_TIMEOUT_MINUTES = int(os.getenv("DEFAULT_TASK_TIMEOUT_MINUTES", "120"))
-
     while True:
-        await asyncio.sleep(STUCK_TASK_CHECK_INTERVAL_SECONDS)
+        await asyncio.sleep(Config.STUCK_TASK_CHECK_INTERVAL_SECONDS)
         try:
             pool = await get_pool()
 
             async with pool.acquire() as conn:
                 stuck = await conn.fetch(
                     """
-                    SELECT 
+                    SELECT
                         t.*,
                         COALESCE(
                             t.timeout_minutes,
@@ -68,7 +97,7 @@ async def stuck_task_monitor():
                         ) || ' minutes'
                     )::INTERVAL
                     """,
-                    DEFAULT_TIMEOUT_MINUTES
+                    Config.DEFAULT_TASK_TIMEOUT_MINUTES
                 )
 
                 for task in stuck:
@@ -86,8 +115,8 @@ async def stuck_task_monitor():
 
                     await conn.execute(
                         """
-                        UPDATE tasks 
-                        SET status = 'pending', assignee_agent = NULL, 
+                        UPDATE tasks
+                        SET status = 'pending', assignee_agent = NULL,
                             assigned_at = NULL, started_at = NULL, updated_at = NOW()
                         WHERE id = $1
                         """,
@@ -105,10 +134,16 @@ async def stuck_task_monitor():
                         task["id"], "auto_released", "running", "pending",
                         f"Task auto-released due to timeout ({timeout} minutes)", "system"
                     )
-        except Exception:
-            logger.error(
-                "Stuck task monitor error",
-                exc_info=True,
-                extra={"action": "stuck_task_monitor_error"}
-            )
-            await reset_pool()
+
+            # 成功执行，重置错误计数
+            _reset_error_count("stuck_task")
+
+        except (asyncpg.PostgresError, asyncpg.ConnectionDoesNotExistError, OSError) as e:
+            # 数据库相关错误，考虑重置连接池
+            logger.error(f"Stuck task monitor DB error: {e}", exc_info=True)
+            if _should_reset_pool("stuck_task"):
+                logger.warning("Resetting connection pool due to repeated DB errors")
+                await reset_pool()
+        except Exception as e:
+            # 其他错误，记录但不重置连接池
+            logger.error(f"Stuck task monitor unexpected error: {e}", exc_info=True)

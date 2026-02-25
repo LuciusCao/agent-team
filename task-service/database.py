@@ -3,34 +3,32 @@ Database connection management
 """
 
 import asyncio
-import os
 
 import asyncpg
 
-DB_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/taskmanager")
+from config import Config
+
 _pool: asyncpg.Pool | None = None
 _pool_lock = asyncio.Lock()
-
-# Connection pool settings
-POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "2"))
-POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
-POOL_COMMAND_TIMEOUT = int(os.getenv("DB_COMMAND_TIMEOUT", "60"))
-POOL_MAX_INACTIVE_TIME = int(os.getenv("DB_MAX_INACTIVE_TIME", "300"))
-POOL_MAX_QUERIES = int(os.getenv("DB_MAX_QUERIES", "100000"))
 
 
 async def _create_pool() -> asyncpg.Pool:
     """创建数据库连接池
-    
+
     包含完整的超时和连接管理配置。
     """
     return await asyncpg.create_pool(
-        DB_URL,
-        min_size=POOL_MIN_SIZE,
-        max_size=POOL_MAX_SIZE,
-        command_timeout=POOL_COMMAND_TIMEOUT,
-        max_inactive_time=POOL_MAX_INACTIVE_TIME,
-        max_queries=POOL_MAX_QUERIES,
+        Config.DATABASE_URL,
+        min_size=Config.DB_POOL_MIN_SIZE,
+        max_size=Config.DB_POOL_MAX_SIZE,
+        command_timeout=Config.DB_COMMAND_TIMEOUT,
+        max_inactive_time=Config.DB_MAX_INACTIVE_TIME,
+        max_queries=Config.DB_MAX_QUERIES,
+        timeout=10,  # 连接建立超时（秒）
+        server_settings={
+            'application_name': 'task-service',
+            'jit': 'off',  # 禁用 JIT 以避免某些兼容性问题
+        }
     )
 
 

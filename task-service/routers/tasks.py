@@ -3,10 +3,10 @@ Task API Router
 """
 
 import json
-import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from config import Config
 from database import get_db
 from models import TaskCreate, TaskReview, TaskUpdate
 from security import rate_limit, verify_api_key
@@ -16,6 +16,7 @@ from utils import (
     log_task_action,
     store_idempotency_response,
     update_agent_status_after_task_change,
+    validate_task_dependencies_for_create,
 )
 
 router = APIRouter()
@@ -23,6 +24,14 @@ router = APIRouter()
 
 @router.post("/", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def create_task(task: TaskCreate, db=Depends(get_db)):
+    """创建任务
+
+    如果指定了 dependencies，会检查是否存在循环依赖。
+    """
+    # 检查循环依赖
+    if task.dependencies:
+        validate_task_dependencies_for_create(task.dependencies)
+
     async with db.acquire() as conn:
         result = await conn.fetchrow(
             """
@@ -158,7 +167,7 @@ async def claim_task(
 
     使用事务确保依赖检查和任务认领的原子性，彻底消除竞态条件。
     """
-    MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS_PER_AGENT", "3"))
+    MAX_CONCURRENT_TASKS = Config.MAX_CONCURRENT_TASKS_PER_AGENT
 
     async with db.acquire() as conn:
         async with conn.transaction():
@@ -438,88 +447,89 @@ async def get_task(task_id: int, db=Depends(get_db)):
 @router.patch("/{task_id}", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def update_task(task_id: int, update: TaskUpdate, db=Depends(get_db)):
     async with db.acquire() as conn:
-        current = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
-        if not current:
-            raise HTTPException(status_code=404, detail="Task not found")
+        async with conn.transaction():
+            current = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+            if not current:
+                raise HTTPException(status_code=404, detail="Task not found")
 
-        updates = []
-        params = []
-        param_num = 1
+            updates = []
+            params = []
+            param_num = 1
 
-        if update.status is not None:
-            updates.append(f"status = ${param_num}")
-            params.append(update.status)
-            param_num += 1
+            if update.status is not None:
+                updates.append(f"status = ${param_num}")
+                params.append(update.status)
+                param_num += 1
 
-            if update.status == "completed":
-                updates.append("completed_at = NOW()")
+                if update.status == "completed":
+                    updates.append("completed_at = NOW()")
 
-                if current["assignee_agent"]:
-                    await conn.execute(
-                        """
-                        UPDATE agents 
-                        SET completed_tasks = completed_tasks + 1, 
-                            total_tasks = total_tasks + 1,
-                            success_rate = (completed_tasks::FLOAT + 1) / NULLIF(total_tasks + 1, 0),
-                            updated_at = NOW()
-                        WHERE name = $1
-                        """,
-                        current["assignee_agent"]
-                    )
-                    await update_agent_status_after_task_change(conn, current["assignee_agent"])
-            elif update.status == "failed":
-                if current["assignee_agent"]:
-                    await conn.execute(
-                        """
-                        UPDATE agents 
-                        SET failed_tasks = failed_tasks + 1,
-                            total_tasks = total_tasks + 1,
-                            success_rate = (completed_tasks::FLOAT) / NULLIF(total_tasks + 1, 0),
-                            updated_at = NOW()
-                        WHERE name = $1
-                        """,
-                        current["assignee_agent"]
-                    )
-                    await update_agent_status_after_task_change(conn, current["assignee_agent"])
+                    if current["assignee_agent"]:
+                        await conn.execute(
+                            """
+                            UPDATE agents
+                            SET completed_tasks = completed_tasks + 1,
+                                total_tasks = total_tasks + 1,
+                                success_rate = (completed_tasks::FLOAT + 1) / NULLIF(total_tasks + 1, 0),
+                                updated_at = NOW()
+                            WHERE name = $1
+                            """,
+                            current["assignee_agent"]
+                        )
+                        await update_agent_status_after_task_change(conn, current["assignee_agent"])
+                elif update.status == "failed":
+                    if current["assignee_agent"]:
+                        await conn.execute(
+                            """
+                            UPDATE agents
+                            SET failed_tasks = failed_tasks + 1,
+                                total_tasks = total_tasks + 1,
+                                success_rate = (completed_tasks::FLOAT) / NULLIF(total_tasks + 1, 0),
+                                updated_at = NOW()
+                            WHERE name = $1
+                            """,
+                            current["assignee_agent"]
+                        )
+                        await update_agent_status_after_task_change(conn, current["assignee_agent"])
 
-        if update.result is not None:
-            updates.append(f"result = ${param_num}")
-            params.append(json.dumps(update.result))
-            param_num += 1
+            if update.result is not None:
+                updates.append(f"result = ${param_num}")
+                params.append(json.dumps(update.result))
+                param_num += 1
 
-        if update.assignee_agent is not None:
-            updates.append(f"assignee_agent = ${param_num}")
-            params.append(update.assignee_agent)
-            param_num += 1
+            if update.assignee_agent is not None:
+                updates.append(f"assignee_agent = ${param_num}")
+                params.append(update.assignee_agent)
+                param_num += 1
 
-        if update.priority is not None:
-            updates.append(f"priority = ${param_num}")
-            params.append(update.priority)
-            param_num += 1
+            if update.priority is not None:
+                updates.append(f"priority = ${param_num}")
+                params.append(update.priority)
+                param_num += 1
 
-        if update.feedback is not None:
-            updates.append(f"feedback = ${param_num}")
-            params.append(update.feedback)
-            param_num += 1
+            if update.feedback is not None:
+                updates.append(f"feedback = ${param_num}")
+                params.append(update.feedback)
+                param_num += 1
 
-        if not updates:
-            return current
+            if not updates:
+                return current
 
-        updates.append("updated_at = NOW()")
-        params.append(task_id)
+            updates.append("updated_at = NOW()")
+            params.append(task_id)
 
-        query = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ${param_num} RETURNING *"
+            query = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ${param_num} RETURNING *"
 
-        result = await conn.fetchrow(query, *params)
+            result = await conn.fetchrow(query, *params)
 
-        await conn.execute(
-            """
-            INSERT INTO task_logs (task_id, action, old_status, new_status, message)
-            VALUES ($1, $2, $3, $4, $5)
-            """,
-            task_id, "status_changed", current["status"], update.status or current["status"],
-            f"Task updated: {update.dict(exclude_none=True)}"
-        )
+            await conn.execute(
+                """
+                INSERT INTO task_logs (task_id, action, old_status, new_status, message)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                task_id, "status_changed", current["status"], update.status or current["status"],
+                f"Task updated: {update.dict(exclude_none=True)}"
+            )
 
     return result
 
@@ -534,64 +544,65 @@ async def review_task(
 ):
     """验收任务 - 支持通过、拒绝（支持幂等性）"""
     async with db.acquire() as conn:
-        # 检查幂等性
-        cached, should_skip = await check_idempotency(conn, idempotency_key)
-        if should_skip:
-            return cached
+        async with conn.transaction():
+            # 检查幂等性
+            cached, should_skip = await check_idempotency(conn, idempotency_key)
+            if should_skip:
+                return cached
 
-        task = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
-        if not task:
-            raise HTTPException(status_code=404, detail="Task not found")
+            task = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+            if not task:
+                raise HTTPException(status_code=404, detail="Task not found")
 
-        if task["status"] != "reviewing":
-            raise HTTPException(status_code=400, detail=f"Cannot review task with status: {task['status']}")
+            if task["status"] != "reviewing":
+                raise HTTPException(status_code=400, detail=f"Cannot review task with status: {task['status']}")
 
-        if review.approved:
-            new_status = "completed"
-            if task["assignee_agent"]:
-                await conn.execute(
-                    """
-                    UPDATE agents 
-                    SET completed_tasks = completed_tasks + 1,
-                        updated_at = NOW()
-                    WHERE name = $1
-                    """,
-                    task["assignee_agent"]
-                )
-                await update_agent_status_after_task_change(conn, task["assignee_agent"])
-        else:
-            new_status = "rejected"
-            if task["assignee_agent"]:
-                await conn.execute(
-                    """
-                    UPDATE agents 
-                    SET failed_tasks = failed_tasks + 1,
-                        updated_at = NOW()
-                    WHERE name = $1
-                    """,
-                    task["assignee_agent"]
-                )
-                await update_agent_status_after_task_change(conn, task["assignee_agent"])
+            if review.approved:
+                new_status = "completed"
+                if task["assignee_agent"]:
+                    await conn.execute(
+                        """
+                        UPDATE agents
+                        SET completed_tasks = completed_tasks + 1,
+                            updated_at = NOW()
+                        WHERE name = $1
+                        """,
+                        task["assignee_agent"]
+                    )
+                    await update_agent_status_after_task_change(conn, task["assignee_agent"])
+            else:
+                new_status = "rejected"
+                if task["assignee_agent"]:
+                    await conn.execute(
+                        """
+                        UPDATE agents
+                        SET failed_tasks = failed_tasks + 1,
+                            updated_at = NOW()
+                        WHERE name = $1
+                        """,
+                        task["assignee_agent"]
+                    )
+                    await update_agent_status_after_task_change(conn, task["assignee_agent"])
 
-        await conn.execute(
-            """
-            UPDATE tasks SET status = $1, feedback = $2, updated_at = NOW(), 
-                completed_at = CASE WHEN $1::varchar = 'completed' THEN NOW() ELSE NULL END
-            WHERE id = $3
-            """,
-            new_status, review.feedback, task_id
-        )
+            await conn.execute(
+                """
+                UPDATE tasks SET status = $1, feedback = $2, updated_at = NOW(),
+                    completed_at = CASE WHEN $1::varchar = 'completed' THEN NOW() ELSE NULL END
+                WHERE id = $3
+                """,
+                new_status, review.feedback, task_id
+            )
 
-        await log_task_action(
-            conn, task_id, "reviewed", task["status"], new_status,
-            f"Reviewed by {reviewer}: {'approved' if review.approved else 'rejected'}. Feedback: {review.feedback}",
-            reviewer
-        )
+            await log_task_action(
+                conn, task_id, "reviewed", task["status"], new_status,
+                f"Reviewed by {reviewer}: {'approved' if review.approved else 'rejected'}. Feedback: {review.feedback}",
+                reviewer
+            )
 
-        updated = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+            updated = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
 
-        # 存储幂等响应
-        response = dict(updated)
-        await store_idempotency_response(conn, idempotency_key, response)
+            # 存储幂等响应
+            response = dict(updated)
+            await store_idempotency_response(conn, idempotency_key, response)
 
     return updated

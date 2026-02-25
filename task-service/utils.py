@@ -5,12 +5,13 @@ Task Service 通用工具函数
 import asyncio
 import json
 import logging
-import os
 import sys
 from datetime import UTC, datetime
 from functools import wraps
 
 import asyncpg
+
+from config import Config
 
 logger = logging.getLogger("task_service")
 
@@ -22,8 +23,9 @@ def setup_logging():
 
     设置根日志记录器和 uvicorn 的日志格式
     """
+    from config import Config
     logger = logging.getLogger("task_service")
-    logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+    logger.setLevel(Config.LOG_LEVEL.upper())
 
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JSONFormatter())
@@ -233,10 +235,10 @@ async def check_dependencies(conn: asyncpg.Connection, task_id: int, for_update:
 
 def validate_task_dependencies(tasks: list) -> None:
     """验证任务依赖关系，检测循环依赖
-    
+
     Args:
         tasks: 任务列表
-    
+
     Raises:
         HTTPException: 如果检测到循环依赖或无效依赖
     """
@@ -271,6 +273,34 @@ def validate_task_dependencies(tasks: list) -> None:
 
     if visited != n:
         raise HTTPException(status_code=400, detail="Circular dependency detected")
+
+
+def validate_task_dependencies_for_create(dependencies: list[int]) -> None:
+    """验证单个任务的依赖关系
+
+    用于 create_task 时检查依赖列表是否有效。
+    注意：这里只能检查基础的有效性，无法检查循环依赖
+    （因为循环依赖需要知道所有相关任务）。
+
+    Args:
+        dependencies: 依赖任务ID列表
+
+    Raises:
+        HTTPException: 如果依赖列表无效
+    """
+    from fastapi import HTTPException
+
+    if not dependencies:
+        return
+
+    # 检查是否有重复依赖
+    if len(dependencies) != len(set(dependencies)):
+        raise HTTPException(status_code=400, detail="Duplicate dependencies detected")
+
+    # 检查是否有负数或零
+    for dep_id in dependencies:
+        if dep_id <= 0:
+            raise HTTPException(status_code=400, detail=f"Invalid dependency ID: {dep_id}")
 
 
 # ============ Agent Utilities ============
