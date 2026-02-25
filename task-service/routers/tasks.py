@@ -214,9 +214,19 @@ async def claim_task(
 
 
 @router.post("/{task_id}/start", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
-async def start_task(task_id: int, agent_name: str, db=Depends(get_db)):
-    """Agent 开始执行任务"""
+async def start_task(
+    task_id: int, 
+    agent_name: str, 
+    idempotency_key: Optional[str] = None,
+    db=Depends(get_db)
+):
+    """Agent 开始执行任务（支持幂等性）"""
     async with db.acquire() as conn:
+        # 检查幂等性
+        cached, should_skip = await check_idempotency(conn, idempotency_key)
+        if should_skip:
+            return cached
+        
         task = await conn.fetchrow(
             "SELECT * FROM tasks WHERE id = $1 AND assignee_agent = $2",
             task_id, agent_name
@@ -251,6 +261,10 @@ async def start_task(task_id: int, agent_name: str, db=Depends(get_db)):
         await log_task_action(
             conn, task_id, "started", "assigned", "running", f"Task started by {agent_name}", agent_name
         )
+        
+        # 存储幂等响应
+        response = dict(result)
+        await store_idempotency_response(conn, idempotency_key, response)
     
     return result
 
@@ -300,9 +314,19 @@ async def submit_task(
 
 
 @router.post("/{task_id}/release", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
-async def release_task(task_id: int, agent_name: str, db=Depends(get_db)):
-    """Agent 释放任务（重新变成 pending）"""
+async def release_task(
+    task_id: int, 
+    agent_name: str, 
+    idempotency_key: Optional[str] = None,
+    db=Depends(get_db)
+):
+    """Agent 释放任务（重新变成 pending，支持幂等性）"""
     async with db.acquire() as conn:
+        # 检查幂等性
+        cached, should_skip = await check_idempotency(conn, idempotency_key)
+        if should_skip:
+            return cached
+        
         task = await conn.fetchrow(
             "SELECT * FROM tasks WHERE id = $1 AND assignee_agent = $2",
             task_id, agent_name
@@ -328,14 +352,27 @@ async def release_task(task_id: int, agent_name: str, db=Depends(get_db)):
         await log_task_action(
             conn, task_id, "released", task["status"], "pending", f"Task released by {agent_name}", agent_name
         )
+        
+        # 存储幂等响应
+        response = dict(result)
+        await store_idempotency_response(conn, idempotency_key, response)
     
     return result
 
 
 @router.post("/{task_id}/retry", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
-async def retry_task(task_id: int, db=Depends(get_db)):
-    """重试失败或被拒绝的任务"""
+async def retry_task(
+    task_id: int, 
+    idempotency_key: Optional[str] = None,
+    db=Depends(get_db)
+):
+    """重试失败或被拒绝的任务（支持幂等性）"""
     async with db.acquire() as conn:
+        # 检查幂等性
+        cached, should_skip = await check_idempotency(conn, idempotency_key)
+        if should_skip:
+            return cached
+        
         task = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
@@ -360,6 +397,10 @@ async def retry_task(task_id: int, db=Depends(get_db)):
         await log_task_action(
             conn, task_id, "retry", task["status"], "pending", f"Task retry (attempt {result['retry_count']})", "system"
         )
+        
+        # 存储幂等响应
+        response = dict(result)
+        await store_idempotency_response(conn, idempotency_key, response)
     
     return result
 
@@ -467,9 +508,20 @@ async def update_task(task_id: int, update: TaskUpdate, db=Depends(get_db)):
 
 
 @router.post("/{task_id}/review", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
-async def review_task(task_id: int, review: TaskReview, reviewer: str, db=Depends(get_db)):
-    """验收任务 - 支持通过、拒绝"""
+async def review_task(
+    task_id: int, 
+    review: TaskReview, 
+    reviewer: str, 
+    idempotency_key: Optional[str] = None,
+    db=Depends(get_db)
+):
+    """验收任务 - 支持通过、拒绝（支持幂等性）"""
     async with db.acquire() as conn:
+        # 检查幂等性
+        cached, should_skip = await check_idempotency(conn, idempotency_key)
+        if should_skip:
+            return cached
+        
         task = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
@@ -519,5 +571,9 @@ async def review_task(task_id: int, review: TaskReview, reviewer: str, db=Depend
         )
         
         updated = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+        
+        # 存储幂等响应
+        response = dict(updated)
+        await store_idempotency_response(conn, idempotency_key, response)
     
     return updated

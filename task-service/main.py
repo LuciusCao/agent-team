@@ -7,7 +7,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -21,6 +21,38 @@ from utils import setup_logging
 # ============ Structured Logging ============
 
 setup_logging()
+logger = logging.getLogger("task_service")
+
+# ============ Constants ============
+
+SENSITIVE_FIELDS = {'api_key', 'token', 'password', 'secret', 'authorization', 'x-api-key'}
+
+
+def sanitize_log_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    """清理日志数据中的敏感信息
+    
+    Args:
+        data: 原始日志数据
+        
+    Returns:
+        清理后的数据，敏感字段替换为 ***
+    """
+    if not isinstance(data, dict):
+        return data
+    
+    sanitized = {}
+    for key, value in data.items():
+        if key.lower() in SENSITIVE_FIELDS:
+            sanitized[key] = '***'
+        elif isinstance(value, dict):
+            sanitized[key] = sanitize_log_data(value)
+        elif isinstance(value, str) and any(sf in key.lower() for sf in SENSITIVE_FIELDS):
+            # 如果 key 包含敏感字段名，也进行脱敏
+            sanitized[key] = value[:3] + '***' if len(value) > 3 else '***'
+        else:
+            sanitized[key] = value
+    return sanitized
+
 
 # ============ FastAPI App ============
 
@@ -47,7 +79,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """请求日志中间件"""
+    """请求日志中间件（带敏感信息过滤）"""
     start_time = time.time()
     client_ip = request.client.host if request.client else "unknown"
     
@@ -55,30 +87,41 @@ async def log_requests(request: Request, call_next):
         response = await call_next(request)
         duration_ms = (time.time() - start_time) * 1000
         
+        log_data = {
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "duration_ms": round(duration_ms, 2),
+            "client_ip": client_ip,
+            "action": "http_request"
+        }
+        
+        # 清理敏感信息
+        safe_log_data = sanitize_log_data(log_data)
+        
         logger.info(
             f"{request.method} {request.url.path} - {response.status_code} - {duration_ms:.2f}ms",
-            extra={
-                "method": request.method,
-                "path": request.url.path,
-                "status_code": response.status_code,
-                "duration_ms": round(duration_ms, 2),
-                "client_ip": client_ip,
-                "action": "http_request"
-            }
+            extra=safe_log_data
         )
         return response
     except Exception as e:
         duration_ms = (time.time() - start_time) * 1000
+        
+        log_data = {
+            "method": request.method,
+            "path": request.url.path,
+            "duration_ms": round(duration_ms, 2),
+            "client_ip": client_ip,
+            "error": str(e),
+            "action": "http_request_error"
+        }
+        
+        # 清理敏感信息
+        safe_log_data = sanitize_log_data(log_data)
+        
         logger.error(
-            f"{request.method} {request.url.path} - ERROR - {duration_ms:.2f}ms - {e}",
-            extra={
-                "method": request.method,
-                "path": request.url.path,
-                "duration_ms": round(duration_ms, 2),
-                "client_ip": client_ip,
-                "error": str(e),
-                "action": "http_request_error"
-            },
+            f"{request.method} {request.url.path} - ERROR - {duration_ms:.2f}ms",
+            extra=safe_log_data,
             exc_info=True
         )
         raise
