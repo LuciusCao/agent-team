@@ -20,6 +20,16 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# 检测 docker compose 命令
+if docker compose version &>/dev/null; then
+    DOCKER_COMPOSE="docker compose"
+elif docker-compose version &>/dev/null; then
+    DOCKER_COMPOSE="docker-compose"
+else
+    echo -e "${RED}错误: 未找到 docker compose 命令${NC}"
+    exit 1
+fi
+
 # 颜色定义
 BLUE='\033[0;34m'
 GREEN='\033[0;32m'
@@ -93,7 +103,7 @@ check_script() {
 # 显示状态
 show_status() {
     echo -e "${BLUE}服务状态:${NC}"
-    docker-compose ps
+    $DOCKER_COMPOSE ps
     
     echo ""
     echo -e "${BLUE}健康检查:${NC}"
@@ -115,7 +125,7 @@ case "${1:-help}" in
     stop)
         shift
         echo -e "${BLUE}停止开发环境...${NC}"
-        docker-compose down
+        $DOCKER_COMPOSE down
         echo -e "${GREEN}✓ 已停止${NC}"
         ;;
     restart)

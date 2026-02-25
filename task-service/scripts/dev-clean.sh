@@ -14,6 +14,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+# 检测 docker compose 命令
+if docker compose version &>/dev/null; then
+    DOCKER_COMPOSE="docker compose"
+elif docker-compose version &>/dev/null; then
+    DOCKER_COMPOSE="docker-compose"
+else
+    echo "错误: 未找到 docker compose 命令"
+    exit 1
+fi
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -52,13 +62,13 @@ confirm() {
 # 停止服务
 stop_services() {
     log_info "停止服务..."
-    docker-compose down
+    $DOCKER_COMPOSE down
 }
 
 # 清空所有数据（包括卷）
 clean_all() {
     log_warn "这将删除所有容器、网络和卷"
-    docker-compose down -v --remove-orphans
+    $DOCKER_COMPOSE down -v --remove-orphans
     
     # 删除构建缓存
     log_info "清理构建缓存..."
@@ -72,14 +82,14 @@ clean_tables() {
     log_info "清空数据库表数据..."
     
     # 检查服务是否运行
-    if ! docker-compose ps | grep -q "task-service.*Up"; then
+    if ! $DOCKER_COMPOSE ps | grep -q "task-service.*Up"; then
         log_info "启动数据库服务..."
-        docker-compose up -d postgres
+        $DOCKER_COMPOSE up -d postgres
         sleep 3
     fi
     
     # 执行清空脚本
-    docker-compose exec -T postgres psql -U taskmanager -d taskmanager << 'EOF'
+    $DOCKER_COMPOSE exec -T postgres psql -U taskmanager -d taskmanager << 'EOF'
 -- 禁用外键约束检查
 SET session_replication_role = 'replica';
 

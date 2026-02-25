@@ -2,15 +2,18 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# 安装依赖
+COPY pyproject.toml .
+RUN pip install --no-cache-dir fastapi uvicorn asyncpg pydantic
 
+# 复制应用代码
 COPY main.py .
 COPY database.py .
 COPY security.py .
 COPY models.py .
 COPY utils.py .
 COPY background.py .
+COPY config.py .
 COPY routers/ ./routers/
 COPY skill/ ./skill/
 

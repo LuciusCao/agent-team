@@ -69,7 +69,14 @@ source ~/.zshrc
 
 ```bash
 cd task-service
-docker-compose up -d
+./scripts/dev.sh start --fresh
+```
+
+或者手动启动：
+
+```bash
+cd task-service
+docker compose up -d
 ```
 
 ### 3. 创建 Agent
@@ -229,67 +236,20 @@ reviewing（待验收）
 
 ## Task Service API
 
-### 项目 API
+Task Service 提供完整的 REST API 用于任务管理。详细 API 文档请参见 [task-service/README.md](task-service/README.md)。
 
-| 接口 | 方法 | 说明 |
-|------|------|------|
-| `/projects` | POST | 创建项目 |
-| `/projects` | GET | 列出项目 |
-| `/projects/{id}` | GET | 项目详情 |
-| `/projects/{id}/progress` | GET | 项目进度统计 |
-| `/projects/{id}/breakdown` | POST | 拆分项目为任务 |
+### 快速参考
 
-### 任务 API
+| 功能 | 端点 |
+|------|------|
+| 项目管理 | `/v1/projects` |
+| 任务管理 | `/v1/tasks` |
+| Agent 管理 | `/v1/agents` |
+| 仪表盘 | `/v1/dashboard/stats` |
 
-| 接口 | 方法 | 说明 |
-|------|------|------|
-| `/tasks` | POST | 创建任务 |
-| `/tasks` | GET | 列出任务（支持过滤） |
-| `/tasks/available` | GET | 可认领的任务（依赖已完成） |
-| `/tasks/available-for/{agent}` | GET | 适合某 Agent 的任务（技能匹配） |
-| `/tasks/{id}` | GET | 任务详情 |
-| `/tasks/{id}/claim` | POST | 认领任务 |
-| `/tasks/{id}/start` | POST | 开始执行 |
-| `/tasks/{id}/submit` | POST | 提交验收 |
-| `/tasks/{id}/release` | POST | 释放任务 |
-| `/tasks/{id}/retry` | POST | 重试失败任务 |
-| `/tasks/{id}/review` | POST | 验收任务 |
+API 文档（Swagger UI）：http://localhost:8080/docs
 
-### Agent API
-
-| 接口 | 方法 | 说明 |
-|------|------|------|
-| `/agents/register` | POST | 注册 Agent |
-| `/agents` | GET | 列出 Agent（支持技能过滤） |
-| `/agents/{name}` | GET | Agent 详情 |
-| `/agents/{name}/heartbeat` | POST | 心跳上报 |
-| `/dashboard/stats` | GET | 仪表盘统计 |
-
-### 示例调用
-
-```bash
-# 创建项目
-curl -X POST http://localhost:8080/projects \
-  -H "Content-Type: application/json" \
-  -d '{"name": "AI 助手调研", "description": "调研主流 AI 助手"}'
-
-# 拆分任务
-curl -X POST http://localhost:8080/projects/1/breakdown \
-  -H "Content-Type: application/json" \
-  -d '[
-    {"title": "需求分析", "task_type": "analysis", "priority": 10, "task_tags": ["planning"]},
-    {"title": "竞品调研", "task_type": "research", "priority": 9, "task_tags": ["research"], "dependencies": [0]}
-  ]'
-
-# 认领任务
-curl -X POST "http://localhost:8080/tasks/1/claim?agent_name=researcher"
-
-# 提交验收
-curl -X POST "http://localhost:8080/tasks/1/submit" \
-  -H "Content-Type: application/json" \
-  -d '{"agent_name": "researcher", "result": {"output": "调研报告内容"}}'
-
-# 验收通过
+## Skills
 curl -X POST "http://localhost:8080/tasks/1/review?reviewer=coordinator" \
   -H "Content-Type: application/json" \
   -d '{"approved": true, "feedback": "质量很好"}'
