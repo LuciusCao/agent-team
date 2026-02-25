@@ -1,6 +1,7 @@
 -- Task Management System Database Schema
 -- v1.0 - Initial
 -- v1.1 - Agent Workforce Extensions
+-- v1.2 - Soft Delete Support
 
 -- 项目表
 CREATE TABLE IF NOT EXISTS projects (
@@ -10,7 +11,8 @@ CREATE TABLE IF NOT EXISTS projects (
     description TEXT,
     status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'paused', 'completed', 'cancelled')),
     created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    updated_at TIMESTAMP DEFAULT NOW(),
+    deleted_at TIMESTAMP  -- v1.2: 软删除支持
 );
 
 -- 任务表 (扩展版本)
@@ -61,7 +63,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     started_at TIMESTAMP,
     updated_at TIMESTAMP DEFAULT NOW(),
     completed_at TIMESTAMP,
-    due_at TIMESTAMP
+    due_at TIMESTAMP,
+    deleted_at TIMESTAMP  -- v1.2: 软删除支持
 );
 
 -- 任务日志表
@@ -100,7 +103,8 @@ CREATE TABLE IF NOT EXISTS agents (
     
     last_heartbeat TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    updated_at TIMESTAMP DEFAULT NOW(),
+    deleted_at TIMESTAMP  -- v1.2: 软删除支持
 );
 
 -- Agent 活跃频道表
@@ -238,6 +242,30 @@ BEGIN
                    WHERE table_name = 'projects' AND column_name = 'status') THEN
         ALTER TABLE projects ADD COLUMN status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'paused', 'completed', 'cancelled'));
     END IF;
+    
+    -- v1.2: 检查并添加 deleted_at 列
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                   WHERE table_name = 'projects' AND column_name = 'deleted_at') THEN
+        ALTER TABLE projects ADD COLUMN deleted_at TIMESTAMP;
+    END IF;
+END $$;
+
+-- v1.2: 任务表添加 deleted_at 列
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                   WHERE table_name = 'tasks' AND column_name = 'deleted_at') THEN
+        ALTER TABLE tasks ADD COLUMN deleted_at TIMESTAMP;
+    END IF;
+END $$;
+
+-- v1.2: Agent 表添加 deleted_at 列
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                   WHERE table_name = 'agents' AND column_name = 'deleted_at') THEN
+        ALTER TABLE agents ADD COLUMN deleted_at TIMESTAMP;
+    END IF;
 END $$;
 
 -- 幂等性键存储表
@@ -249,14 +277,19 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 
 -- 幂等性键索引（用于快速清理过期数据）
 CREATE INDEX IF NOT EXISTS idx_idempotency_keys_created_at ON idempotency_keys(created_at);
-CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
-CREATE INDEX IF NOT EXISTS idx_agents_skills ON agents USING GIN(skills);
-CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
-CREATE INDEX IF NOT EXISTS idx_tasks_task_tags ON tasks USING GIN(task_tags);
-CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_agent);
-CREATE INDEX IF NOT EXISTS idx_tasks_reviewer ON tasks(reviewer_id);
+CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_agents_skills ON agents USING GIN(skills) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_task_tags ON tasks USING GIN(task_tags) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_agent) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_reviewer ON tasks(reviewer_id) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_task_logs_task_id ON task_logs(task_id);
 CREATE INDEX IF NOT EXISTS idx_agent_channels_agent ON agent_channels(agent_name);
 CREATE INDEX IF NOT EXISTS idx_agent_channels_channel ON agent_channels(channel_id);
+
+-- v1.2: 软删除相关索引
+CREATE INDEX IF NOT EXISTS idx_tasks_deleted_at ON tasks(deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_agents_deleted_at ON agents(deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_projects_deleted_at ON projects(deleted_at) WHERE deleted_at IS NOT NULL;

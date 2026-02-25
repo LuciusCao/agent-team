@@ -235,9 +235,10 @@ app.include_router(channels.channels_router, prefix="/channels", tags=["channels
 
 @app.on_event("startup")
 async def startup_event():
-    from background import heartbeat_monitor, stuck_task_monitor
+    from background import heartbeat_monitor, soft_delete_cleanup_monitor, stuck_task_monitor
     asyncio.create_task(heartbeat_monitor())
     asyncio.create_task(stuck_task_monitor())
+    asyncio.create_task(soft_delete_cleanup_monitor())
 
 
 if __name__ == "__main__":
