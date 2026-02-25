@@ -61,5 +61,5 @@ async def get_dashboard_stats(db=Depends(get_db)):
         "projects": dict(project_stats),
         "tasks": dict(task_stats),
         "agents": dict(agent_stats),
-        "recent_activity": [dict(l) for l in recent_logs]
+        "recent_activity": [dict(log) for log in recent_logs]
     }

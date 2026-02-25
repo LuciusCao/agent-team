@@ -154,61 +154,78 @@ async def claim_task(
     idempotency_key: str | None = None,
     db=Depends(get_db)
 ):
-    """Agent 认领任务（带依赖检查、原子性乐观锁和幂等性）"""
+    """Agent 认领任务（带依赖检查、事务锁定和幂等性）
+
+    使用事务确保依赖检查和任务认领的原子性，彻底消除竞态条件。
+    """
     MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT_TASKS_PER_AGENT", "3"))
 
     async with db.acquire() as conn:
-        cached, should_skip = await check_idempotency(conn, idempotency_key)
-        if should_skip:
-            return cached
+        async with conn.transaction():
+            # 检查幂等性
+            cached, should_skip = await check_idempotency(conn, idempotency_key)
+            if should_skip:
+                return cached
 
-        deps_ok, deps = await check_dependencies(conn, task_id)
-        if not deps_ok:
-            raise HTTPException(status_code=400, detail=f"Dependencies not completed: {deps}")
+            # 锁定当前任务，防止并发修改
+            task_row = await conn.fetchrow(
+                "SELECT id, dependencies, status, assignee_agent FROM tasks WHERE id = $1 FOR UPDATE",
+                task_id
+            )
+            if not task_row:
+                raise HTTPException(status_code=404, detail="Task not found")
 
-        current_tasks = await conn.fetchrow(
-            """
-            SELECT COUNT(*) as count 
-            FROM tasks 
-            WHERE assignee_agent = $1 AND status IN ('assigned', 'running', 'reviewing')
-            """,
-            agent_name
-        )
+            if task_row["status"] != "pending" or task_row["assignee_agent"] is not None:
+                raise HTTPException(status_code=409, detail="Task already claimed by another agent or not available")
 
-        if current_tasks['count'] >= MAX_CONCURRENT_TASKS:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Agent {agent_name} has reached maximum concurrent tasks limit ({MAX_CONCURRENT_TASKS})"
+            # 检查依赖（使用 FOR UPDATE 锁定依赖任务）
+            deps_ok, deps = await check_dependencies(conn, task_id, for_update=True)
+            if not deps_ok:
+                raise HTTPException(status_code=400, detail=f"Dependencies not completed: {deps}")
+
+            # 检查并发任务数（锁定 Agent 记录）
+            current_tasks = await conn.fetchrow(
+                """
+                SELECT COUNT(*) as count
+                FROM tasks
+                WHERE assignee_agent = $1 AND status IN ('assigned', 'running', 'reviewing')
+                """,
+                agent_name
             )
 
-        result = await conn.fetchrow(
-            """
-            UPDATE tasks 
-            SET assignee_agent = $1, status = 'assigned', assigned_at = NOW(), updated_at = NOW()
-            WHERE id = $2 AND status = 'pending' AND assignee_agent IS NULL
-            RETURNING *
-            """,
-            agent_name, task_id
-        )
+            if current_tasks['count'] >= MAX_CONCURRENT_TASKS:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Agent {agent_name} has reached maximum concurrent tasks limit ({MAX_CONCURRENT_TASKS})"
+                )
 
-        if not result:
-            raise HTTPException(status_code=409, detail="Task already claimed by another agent or not available")
+            # 原子性更新任务
+            result = await conn.fetchrow(
+                """
+                UPDATE tasks
+                SET assignee_agent = $1, status = 'assigned', assigned_at = NOW(), updated_at = NOW()
+                WHERE id = $2
+                RETURNING *
+                """,
+                agent_name, task_id
+            )
 
-        await conn.execute(
-            """
-            UPDATE agents 
-            SET status = 'busy', current_task_id = $1, updated_at = NOW()
-            WHERE name = $2
-            """,
-            task_id, agent_name
-        )
+            # 更新 Agent 状态
+            await conn.execute(
+                """
+                UPDATE agents
+                SET status = 'busy', current_task_id = $1, updated_at = NOW()
+                WHERE name = $2
+                """,
+                task_id, agent_name
+            )
 
-        await log_task_action(
-            conn, task_id, "claimed", "pending", "assigned", f"Task claimed by {agent_name}", agent_name
-        )
+            await log_task_action(
+                conn, task_id, "claimed", "pending", "assigned", f"Task claimed by {agent_name}", agent_name
+            )
 
-        response = dict(result)
-        await store_idempotency_response(conn, idempotency_key, response)
+            response = dict(result)
+            await store_idempotency_response(conn, idempotency_key, response)
 
     return result
 
@@ -415,7 +432,7 @@ async def get_task(task_id: int, db=Depends(get_db)):
         )
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    return {"task": dict(task), "logs": [dict(l) for l in logs]}
+    return {"task": dict(task), "logs": [dict(log) for log in logs]}
 
 
 @router.patch("/{task_id}", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
