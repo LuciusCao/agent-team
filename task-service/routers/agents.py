@@ -3,17 +3,17 @@ Agent API Router
 """
 
 import json
-from typing import Optional
-from fastapi import APIRouter, HTTPException, Depends
+
+from fastapi import APIRouter, Depends, HTTPException
 
 from database import get_db
-from security import verify_api_key, rate_limit
-from models import AgentRegister, AgentHeartbeat
+from models import AgentHeartbeat, AgentRegister
+from security import rate_limit, verify_api_key
 
 router = APIRouter()
 
 
-@router.post("/register", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
+@router.post("/register/", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def register_agent(agent: AgentRegister, db=Depends(get_db)):
     async with db.acquire() as conn:
         result = await conn.fetchrow(
@@ -36,7 +36,7 @@ async def register_agent(agent: AgentRegister, db=Depends(get_db)):
     return result
 
 
-@router.post("/{name}/heartbeat", dependencies=[Depends(rate_limit)])
+@router.post("/{name}/heartbeat/", dependencies=[Depends(rate_limit)])
 async def agent_heartbeat(name: str, data: AgentHeartbeat, db=Depends(get_db)):
     async with db.acquire() as conn:
         result = await conn.fetchrow(
@@ -52,7 +52,7 @@ async def agent_heartbeat(name: str, data: AgentHeartbeat, db=Depends(get_db)):
 
 
 @router.get("/", dependencies=[Depends(rate_limit)])
-async def list_agents(status: Optional[str] = None, skill: Optional[str] = None, db=Depends(get_db)):
+async def list_agents(status: str | None = None, skill: str | None = None, db=Depends(get_db)):
     async with db.acquire() as conn:
         if skill:
             results = await conn.fetch(
@@ -85,7 +85,7 @@ async def unregister_agent(name: str, db=Depends(get_db)):
     return {"message": f"Agent {name} unregistered"}
 
 
-@router.get("/{name}/channels", dependencies=[Depends(rate_limit)])
+@router.get("/{name}/channels/", dependencies=[Depends(rate_limit)])
 async def get_agent_channels(name: str, db=Depends(get_db)):
     async with db.acquire() as conn:
         results = await conn.fetch(

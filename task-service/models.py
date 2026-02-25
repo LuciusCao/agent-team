@@ -2,64 +2,65 @@
 Pydantic models for request/response validation
 """
 
-from typing import Optional, List
-from pydantic import BaseModel
+from datetime import datetime
+
+from pydantic import BaseModel, Field
 
 
 class AgentRegister(BaseModel):
-    name: str
-    discord_user_id: Optional[str] = None
-    role: str
-    capabilities: Optional[dict] = None
-    skills: Optional[List[str]] = None
+    name: str = Field(..., max_length=100)
+    discord_user_id: str | None = Field(None, max_length=100)
+    role: str = Field(..., max_length=50)
+    capabilities: dict | None = None
+    skills: list[str] | None = None
 
 
 class AgentHeartbeat(BaseModel):
-    name: str
-    current_task_id: Optional[int] = None
+    name: str = Field(..., max_length=100)
+    current_task_id: int | None = None
 
 
 class AgentChannel(BaseModel):
-    agent_name: str
-    channel_id: str
+    agent_name: str = Field(..., max_length=100)
+    channel_id: str = Field(..., max_length=50)
 
 
 class ProjectCreate(BaseModel):
-    name: str
-    discord_channel_id: Optional[str] = None
-    description: Optional[str] = None
+    name: str = Field(..., max_length=255)
+    discord_channel_id: str | None = Field(None, max_length=50)
+    description: str | None = Field(None, max_length=5000)
 
 
 class TaskCreate(BaseModel):
     project_id: int
-    title: str
-    description: Optional[str] = None
-    task_type: str
-    priority: Optional[int] = 5
-    assignee_agent: Optional[str] = None
-    reviewer_id: Optional[str] = None
-    reviewer_mention: Optional[str] = None
-    acceptance_criteria: Optional[str] = None
-    parent_task_id: Optional[int] = None
-    dependencies: Optional[List[int]] = None
-    task_tags: Optional[List[str]] = None
-    estimated_hours: Optional[float] = None
-    timeout_minutes: Optional[int] = None
-    created_by: Optional[str] = None
-    due_at: Optional[str] = None
+    title: str = Field(..., max_length=500)
+    description: str | None = Field(None, max_length=10000)
+    task_type: str = Field(..., max_length=50)
+    priority: int | None = Field(5, ge=1, le=10)
+    assignee_agent: str | None = Field(None, max_length=100)
+    reviewer_id: str | None = Field(None, max_length=100)
+    reviewer_mention: str | None = Field(None, max_length=100)
+    acceptance_criteria: str | None = Field(None, max_length=5000)
+    parent_task_id: int | None = None
+    dependencies: list[int] | None = None
+    task_tags: list[str] | None = None
+    estimated_hours: float | None = Field(None, ge=0)
+    timeout_minutes: int | None = Field(None, ge=1)
+    created_by: str | None = Field(None, max_length=100)
+    due_at: datetime | None = None  # Pydantic 自动验证 ISO 格式
 
 
 class TaskUpdate(BaseModel):
-    status: Optional[str] = None
-    result: Optional[dict] = None
-    assignee_agent: Optional[str] = None
-    priority: Optional[int] = None
-    feedback: Optional[str] = None
+    status: str | None = Field(None, max_length=50)
+    result: dict | None = None
+    assignee_agent: str | None = Field(None, max_length=100)
+    priority: int | None = Field(None, ge=1, le=10)
+    feedback: str | None = Field(None, max_length=10000)
 
 
 class TaskReview(BaseModel):
     approved: bool
-    feedback: Optional[str] = None
+    feedback: str | None = Field(None, max_length=5000)
 
 
 class HealthStatus(BaseModel):
@@ -67,4 +68,4 @@ class HealthStatus(BaseModel):
     version: str
     timestamp: str
     database: str
-    uptime_seconds: Optional[float] = None
+    uptime_seconds: float | None = None
