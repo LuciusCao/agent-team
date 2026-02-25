@@ -3,7 +3,8 @@ Pydantic models for request/response validation
 """
 
 from typing import Optional, List
-from pydantic import BaseModel
+from datetime import datetime
+from pydantic import BaseModel, Field
 
 
 class AgentRegister(BaseModel):
@@ -46,7 +47,7 @@ class TaskCreate(BaseModel):
     estimated_hours: Optional[float] = None
     timeout_minutes: Optional[int] = None
     created_by: Optional[str] = None
-    due_at: Optional[str] = None
+    due_at: Optional[datetime] = None  # Pydantic 自动验证 ISO 格式
 
 
 class TaskUpdate(BaseModel):

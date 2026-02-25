@@ -106,8 +106,11 @@ def retry_on_db_error(max_retries=3, base_delay=1):
 async def check_idempotency(conn: asyncpg.Connection, idempotency_key: Optional[str] = None):
     """检查幂等性（数据库持久化版本）
     
-    如果提供了幂等键且已存在，返回缓存的响应。
+    如果提供了幂等键且已存在（未过期），返回缓存的响应。
     否则返回 None，表示需要执行操作。
+    
+    注意：不过期键的清理交给后台任务或数据库定时任务处理，
+    避免在检查路径上引入竞态条件。
     
     Args:
         conn: 数据库连接
@@ -119,14 +122,12 @@ async def check_idempotency(conn: asyncpg.Connection, idempotency_key: Optional[
     if not idempotency_key:
         return None, False
     
-    # 清理过期的幂等键（使用数据库）
-    await conn.execute(
-        "DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '24 hours'"
-    )
-    
-    # 检查幂等键是否存在
+    # 检查幂等键是否存在且未过期（24小时内）
+    # 不在此处清理过期键，避免竞态条件
     row = await conn.fetchrow(
-        "SELECT response FROM idempotency_keys WHERE key = $1",
+        """SELECT response FROM idempotency_keys 
+           WHERE key = $1 
+           AND created_at > NOW() - INTERVAL '24 hours'""",
         idempotency_key
     )
     
@@ -139,6 +140,34 @@ async def check_idempotency(conn: asyncpg.Connection, idempotency_key: Optional[
         return cached_response, True
     
     return None, False
+
+
+async def cleanup_expired_idempotency_keys(conn: asyncpg.Connection) -> int:
+    """清理过期的幂等性键
+    
+    应该在后台任务中定期调用，而不是在检查路径上。
+    
+    Args:
+        conn: 数据库连接
+    
+    Returns:
+        int: 清理的键数量
+    """
+    result = await conn.execute(
+        "DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '24 hours'"
+    )
+    # 解析结果，格式类似 "DELETE 10"
+    try:
+        count = int(result.split()[1]) if result.split() else 0
+    except (IndexError, ValueError):
+        count = 0
+    
+    if count > 0:
+        logger.info(
+            f"Cleaned up {count} expired idempotency keys",
+            extra={"action": "idempotency_cleanup", "count": count}
+        )
+    return count
 
 
 async def store_idempotency_response(conn: asyncpg.Connection, idempotency_key: Optional[str], response: Dict):
