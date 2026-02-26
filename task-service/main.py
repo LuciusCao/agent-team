@@ -233,12 +233,30 @@ app.include_router(channels.channels_router, prefix="/channels", tags=["channels
 
 # ============ Background Tasks ============
 
+_background_tasks = []
+
 @app.on_event("startup")
 async def startup_event():
     from background import heartbeat_monitor, soft_delete_cleanup_monitor, stuck_task_monitor
-    asyncio.create_task(heartbeat_monitor())
-    asyncio.create_task(stuck_task_monitor())
-    asyncio.create_task(soft_delete_cleanup_monitor())
+    _background_tasks.append(asyncio.create_task(heartbeat_monitor()))
+    _background_tasks.append(asyncio.create_task(stuck_task_monitor()))
+    _background_tasks.append(asyncio.create_task(soft_delete_cleanup_monitor()))
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """优雅关闭处理"""
+    logger.info("Shutting down task service...")
+    
+    # 停止后台任务
+    from background import shutdown_background_tasks
+    await shutdown_background_tasks()
+    
+    # 关闭数据库连接池
+    from database import reset_pool
+    await reset_pool()
+    
+    logger.info("Task service shutdown complete")
 
 
 if __name__ == "__main__":
