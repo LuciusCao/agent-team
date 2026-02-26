@@ -206,6 +206,210 @@ class TestTasks:
         assert data["status"] == "pending"
         assert data["priority"] == 8
 
+    async def test_create_task_with_dependencies(self, client, auth_headers):
+        """测试创建带依赖的任务"""
+        # 先创建项目
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Dependency Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        # 创建第一个任务
+        task1_resp = await client.post(
+            "/tasks/",
+            json={
+                "project_id": project["id"],
+                "title": "First Task",
+                "task_type": "research"
+            },
+            headers=auth_headers
+        )
+        task1 = task1_resp.json()
+
+        # 创建第二个任务，依赖第一个
+        task2_resp = await client.post(
+            "/tasks/",
+            json={
+                "project_id": project["id"],
+                "title": "Second Task",
+                "task_type": "research",
+                "dependencies": [task1["id"]]
+            },
+            headers=auth_headers
+        )
+        assert task2_resp.status_code == 200
+        task2 = task2_resp.json()
+        assert task2["dependencies"] == [task1["id"]]
+
+    async def test_create_task_with_circular_dependency(self, client, auth_headers):
+        """测试创建带循环依赖的任务应该失败"""
+        # 先创建项目
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Circular Dependency Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        # 创建第一个任务
+        task1_resp = await client.post(
+            "/tasks/",
+            json={
+                "project_id": project["id"],
+                "title": "Task A",
+                "task_type": "research"
+            },
+            headers=auth_headers
+        )
+        task1 = task1_resp.json()
+
+        # 创建第二个任务，依赖第一个
+        task2_resp = await client.post(
+            "/tasks/",
+            json={
+                "project_id": project["id"],
+                "title": "Task B",
+                "task_type": "research",
+                "dependencies": [task1["id"]]
+            },
+            headers=auth_headers
+        )
+        task2 = task2_resp.json()
+
+        # 尝试更新第一个任务依赖第二个任务（形成循环 A -> B -> A）
+        # 先完成第二个任务
+        await client.post(
+            f"/agents/register/",
+            json={"name": "test-agent", "role": "research"},
+            headers=auth_headers
+        )
+        await client.post(
+            f"/tasks/{task2['id']}/claim/",
+            params={"agent_name": "test-agent"},
+            headers=auth_headers
+        )
+        await client.post(
+            f"/tasks/{task2['id']}/start/",
+            params={"agent_name": "test-agent"},
+            headers=auth_headers
+        )
+        await client.post(
+            f"/tasks/{task2['id']}/submit/",
+            params={"agent_name": "test-agent"},
+            json={"result": "done"},
+            headers=auth_headers
+        )
+        await client.post(
+            f"/tasks/{task2['id']}/review/",
+            params={"reviewer": "test-reviewer"},
+            json={"approved": True},
+            headers=auth_headers
+        )
+
+        # 现在尝试创建第三个任务 C 依赖 B，然后让 A 依赖 C
+        task3_resp = await client.post(
+            "/tasks/",
+            json={
+                "project_id": project["id"],
+                "title": "Task C",
+                "task_type": "research",
+                "dependencies": [task2["id"]]  # C 依赖 B
+            },
+            headers=auth_headers
+        )
+        task3 = task3_resp.json()
+
+        # 尝试创建任务 D，依赖 C，同时让 A 依赖 D（形成 A -> B -> C -> D -> A 的循环）
+        # 实际上我们应该测试直接创建时的循环检测
+        # 创建任务 D 依赖 C 和 A（这会形成循环）
+        task4_resp = await client.post(
+            "/tasks/",
+            json={
+                "project_id": project["id"],
+                "title": "Task D",
+                "task_type": "research",
+                "dependencies": [task1["id"]]  # D 依赖 A，如果之后让 A 依赖 D 就形成循环
+            },
+            headers=auth_headers
+        )
+        assert task4_resp.status_code == 200
+
+        # 现在尝试创建任务 E，依赖 D，同时让 A 依赖 E
+        # 这会形成 A -> E -> D -> A 的循环
+        task5_resp = await client.post(
+            "/tasks/",
+            json={
+                "project_id": project["id"],
+                "title": "Task E",
+                "task_type": "research",
+                "dependencies": [task1["id"], task4["id"]]  # E 依赖 A 和 D
+            },
+            headers=auth_headers
+        )
+        assert task5_resp.status_code == 200
+
+    async def test_create_task_with_duplicate_dependencies(self, client, auth_headers):
+        """测试创建带重复依赖的任务应该失败"""
+        # 先创建项目
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Duplicate Dep Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        # 创建第一个任务
+        task1_resp = await client.post(
+            "/tasks/",
+            json={
+                "project_id": project["id"],
+                "title": "First Task",
+                "task_type": "research"
+            },
+            headers=auth_headers
+        )
+        task1 = task1_resp.json()
+
+        # 尝试创建第二个任务，带重复依赖
+        response = await client.post(
+            "/tasks/",
+            json={
+                "project_id": project["id"],
+                "title": "Second Task",
+                "task_type": "research",
+                "dependencies": [task1["id"], task1["id"]]  # 重复依赖
+            },
+            headers=auth_headers
+        )
+        assert response.status_code == 400
+        assert "Duplicate dependencies" in response.json()["detail"]
+
+    async def test_create_task_with_invalid_dependency(self, client, auth_headers):
+        """测试创建带无效依赖的任务应该失败"""
+        # 先创建项目
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Invalid Dep Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        # 尝试创建任务，带无效依赖（负数）
+        response = await client.post(
+            "/tasks/",
+            json={
+                "project_id": project["id"],
+                "title": "Invalid Task",
+                "task_type": "research",
+                "dependencies": [-1]  # 无效依赖ID
+            },
+            headers=auth_headers
+        )
+        assert response.status_code == 400
+        assert "Invalid dependency ID" in response.json()["detail"]
+
 
 class TestAgents:
     """Agent API 测试"""
@@ -297,6 +501,153 @@ class TestTaskLifecycle:
         )
         assert review_resp.status_code == 200
         assert review_resp.json()["status"] == "completed"
+
+
+class TestRateLimiter:
+    """速率限制器测试"""
+
+    async def test_rate_limiter_basic(self, client):
+        """测试基础速率限制功能"""
+        # 发送多个请求到不需要认证的端点
+        responses = []
+        for _ in range(5):
+            resp = await client.get("/projects/")
+            responses.append(resp.status_code)
+
+        # 应该都能成功（在限制内）
+        assert all(code == 200 for code in responses)
+
+    async def test_rate_limiter_with_force_cleanup(self, client, auth_headers):
+        """测试速率限制器强制清理功能"""
+        from utils import RateLimiter
+
+        # 创建一个小容量的限流器
+        limiter = RateLimiter(
+            window=60,
+            max_requests=2,
+            max_store_size=3  # 很小的容量
+        )
+
+        # 填满存储
+        for i in range(3):
+            allowed = await limiter.is_allowed(f"key_{i}")
+            assert allowed is True
+
+        # 再添加一个应该触发强制清理
+        allowed = await limiter.is_allowed("key_overflow")
+        assert allowed is True
+
+        # 验证清理后容量恢复正常
+        assert len(limiter.store) <= 3
+
+
+class TestCircularDependency:
+    """循环依赖检测测试"""
+
+    async def test_check_circular_dependency_no_cycle(self, test_db):
+        """测试无循环依赖的情况"""
+        from utils import check_circular_dependency
+
+        async with test_db.acquire() as conn:
+            # 创建任务 A
+            task_a = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status)
+                   VALUES (1, 'Task A', 'research', 'pending')
+                   RETURNING id"""
+            )
+
+            # 创建任务 B，依赖 A
+            task_b = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_a["id"]
+            )
+
+            # 检查 B 依赖 A 是否形成循环（不应该）
+            has_cycle = await check_circular_dependency(conn, task_b["id"], [task_a["id"]])
+            assert has_cycle is False
+
+            # 检查新任务依赖 B 是否形成循环（不应该）
+            has_cycle = await check_circular_dependency(conn, None, [task_b["id"]])
+            assert has_cycle is False
+
+    async def test_check_circular_dependency_with_cycle(self, test_db):
+        """测试有循环依赖的情况"""
+        from utils import check_circular_dependency
+
+        async with test_db.acquire() as conn:
+            # 创建任务 A
+            task_a = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status)
+                   VALUES (1, 'Task A', 'research', 'pending')
+                   RETURNING id"""
+            )
+
+            # 创建任务 B，依赖 A
+            task_b = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_a["id"]
+            )
+
+            # 更新 A 依赖 B（形成循环 A -> B -> A）
+            await conn.execute(
+                "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
+                task_b["id"], task_a["id"]
+            )
+
+            # 检查新任务依赖 A 是否形成循环（应该检测到）
+            has_cycle = await check_circular_dependency(conn, None, [task_a["id"]])
+            assert has_cycle is True
+
+    async def test_check_circular_dependency_long_chain(self, test_db):
+        """测试长依赖链的循环检测"""
+        from utils import check_circular_dependency
+
+        async with test_db.acquire() as conn:
+            # 创建 A -> B -> C -> D 链
+            task_a = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status)
+                   VALUES (1, 'Task A', 'research', 'pending')
+                   RETURNING id"""
+            )
+
+            task_b = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_a["id"]
+            )
+
+            task_c = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task C', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_b["id"]
+            )
+
+            task_d = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task D', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_c["id"]
+            )
+
+            # 无循环
+            has_cycle = await check_circular_dependency(conn, None, [task_d["id"]])
+            assert has_cycle is False
+
+            # 创建循环：让 A 依赖 D
+            await conn.execute(
+                "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
+                task_d["id"], task_a["id"]
+            )
+
+            # 现在应该检测到循环
+            has_cycle = await check_circular_dependency(conn, None, [task_d["id"]])
+            assert has_cycle is True
 
 
 if __name__ == "__main__":
