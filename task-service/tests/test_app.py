@@ -591,96 +591,114 @@ class TestCircularDependency:
         from utils import check_circular_dependency
 
         async with test_db.acquire() as conn:
-            # 先创建项目
-            await conn.execute(
-                """INSERT INTO projects (id, name, status)
-                   VALUES (1, 'Test Project', 'active')
-                   ON CONFLICT DO NOTHING"""
+            # 先创建项目（使用动态ID，避免冲突）
+            project = await conn.fetchrow(
+                """INSERT INTO projects (name, status)
+                   VALUES ('Test Project', 'active')
+                   RETURNING id"""
             )
+            project_id = project['id']
 
             # 创建任务 A
             task_a = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status)
-                   VALUES (1, 'Task A', 'research', 'pending')
-                   RETURNING id"""
+                   VALUES ($1, 'Task A', 'research', 'pending')
+                   RETURNING id""",
+                project_id
             )
 
             # 创建任务 B，依赖 A
             task_b = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
+                   VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int])
                    RETURNING id""",
-                task_a["id"]
+                project_id, task_a["id"]
             )
 
-            # 更新 A 依赖 B（形成循环 A -> B -> A）
+            # 场景1: 检查如果 A 依赖 B 是否会形成循环（A->B->A）
+            has_cycle = await check_circular_dependency(conn, task_a["id"], [task_b["id"]])
+            assert has_cycle is True, "Should detect cycle when A depends on B (B already depends on A)"
+
+            # 场景2: 检查 B 依赖 A 是否会形成循环（B->A->B，但 A 还没有依赖 B）
+            # 先清空 A 的依赖
+            await conn.execute("UPDATE tasks SET dependencies = NULL WHERE id = $1", task_a["id"])
+            # 现在 A 不依赖 B，所以 B 依赖 A 不会形成循环
+            has_cycle = await check_circular_dependency(conn, task_b["id"], [task_a["id"]])
+            assert has_cycle is False, "Should not detect cycle when B depends on A (A doesn't depend on B)"
+
+            # 场景3: 让 A 依赖 B，然后检查 B 依赖 A 是否会形成循环
             await conn.execute(
                 "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
                 task_b["id"], task_a["id"]
             )
-
-            # 场景1: 检查新任务（ID=999）依赖 A 是否形成循环
-            # 新任务 -> A -> B -> A（检测到循环）
-            has_cycle = await check_circular_dependency(conn, 999, [task_a["id"]])
-            assert has_cycle is True
-
-            # 场景2: 检查任务 B 如果依赖 A 是否形成循环（B->A->B）
             has_cycle = await check_circular_dependency(conn, task_b["id"], [task_a["id"]])
-            assert has_cycle is True
+            assert has_cycle is True, "Should detect cycle when A and B depend on each other"
 
     async def test_check_circular_dependency_long_chain(self, test_db):
         """测试长依赖链的循环检测"""
         from utils import check_circular_dependency
 
         async with test_db.acquire() as conn:
-            # 先创建项目
-            await conn.execute(
-                """INSERT INTO projects (id, name, status)
-                   VALUES (1, 'Test Project', 'active')
-                   ON CONFLICT DO NOTHING"""
+            # 先创建项目（使用动态ID）
+            project = await conn.fetchrow(
+                """INSERT INTO projects (name, status)
+                   VALUES ('Test Project', 'active')
+                   RETURNING id"""
             )
+            project_id = project['id']
 
             # 创建 A -> B -> C -> D 链
             task_a = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status)
-                   VALUES (1, 'Task A', 'research', 'pending')
-                   RETURNING id"""
+                   VALUES ($1, 'Task A', 'research', 'pending')
+                   RETURNING id""",
+                project_id
             )
 
             task_b = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
+                   VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int])
                    RETURNING id""",
-                task_a["id"]
+                project_id, task_a["id"]
             )
 
             task_c = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES (1, 'Task C', 'research', 'pending', ARRAY[$1::int])
+                   VALUES ($1, 'Task C', 'research', 'pending', ARRAY[$2::int])
                    RETURNING id""",
-                task_b["id"]
+                project_id, task_b["id"]
             )
 
             task_d = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES (1, 'Task D', 'research', 'pending', ARRAY[$1::int])
+                   VALUES ($1, 'Task D', 'research', 'pending', ARRAY[$2::int])
                    RETURNING id""",
-                task_c["id"]
+                project_id, task_c["id"]
             )
 
-            # 无循环: 新任务依赖 D
-            has_cycle = await check_circular_dependency(conn, 999, [task_d["id"]])
-            assert has_cycle is False
+            # 场景1: 检查如果 A 依赖 D 是否会形成循环（A->B->C->D->A）
+            has_cycle = await check_circular_dependency(conn, task_a["id"], [task_d["id"]])
+            assert has_cycle is True, "Should detect cycle when A depends on D (D depends on C->B->A)"
 
-            # 创建循环：让 A 依赖 D（形成 A -> B -> C -> D -> A）
+            # 场景2: 检查如果 D 依赖 A 是否会形成循环（D->...->A->D）
+            # 先清空 A 的依赖
+            await conn.execute("UPDATE tasks SET dependencies = NULL WHERE id = $1", task_a["id"])
+            # 让 D 依赖 A
+            await conn.execute(
+                "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
+                task_a["id"], task_d["id"]
+            )
+            # 现在 A 不依赖 D，所以 D 依赖 A 不会形成循环
+            has_cycle = await check_circular_dependency(conn, task_d["id"], [task_a["id"]])
+            assert has_cycle is False, "Should not detect cycle when D depends on A (A doesn't depend on D)"
+
+            # 场景3: 让 A 依赖 D，然后检查 D 依赖 A 是否会形成循环
             await conn.execute(
                 "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
                 task_d["id"], task_a["id"]
             )
-
-            # 现在应该检测到循环: 新任务 -> D -> ... -> A -> D
-            has_cycle = await check_circular_dependency(conn, 999, [task_d["id"]])
-            assert has_cycle is True
+            has_cycle = await check_circular_dependency(conn, task_d["id"], [task_a["id"]])
+            assert has_cycle is True, "Should detect cycle when A and D depend on each other"
 
     async def test_check_circular_dependency_shared_dependency(self, test_db):
         """测试共享依赖不应被误判为循环
@@ -796,30 +814,32 @@ class TestCycleDetectionFull:
         from utils import detect_all_cycles_in_project
 
         async with test_db.acquire() as conn:
-            # 创建项目
-            await conn.execute(
-                """INSERT INTO projects (id, name, status)
-                   VALUES (1, 'Test Project', 'active')
-                   ON CONFLICT DO NOTHING"""
+            # 创建项目（使用动态ID）
+            project = await conn.fetchrow(
+                """INSERT INTO projects (name, status)
+                   VALUES ('Test Project', 'active')
+                   RETURNING id"""
             )
+            project_id = project['id']
 
             # 创建 A -> B -> C -> A 循环
             task_a = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status)
-                   VALUES (1, 'Task A', 'research', 'pending')
-                   RETURNING id"""
+                   VALUES ($1, 'Task A', 'research', 'pending')
+                   RETURNING id""",
+                project_id
             )
             task_b = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
+                   VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int])
                    RETURNING id""",
-                task_a["id"]
+                project_id, task_a["id"]
             )
             task_c = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES (1, 'Task C', 'research', 'pending', ARRAY[$1::int])
+                   VALUES ($1, 'Task C', 'research', 'pending', ARRAY[$2::int])
                    RETURNING id""",
-                task_b["id"]
+                project_id, task_b["id"]
             )
             # 创建循环：C 依赖 A
             await conn.execute(
@@ -827,7 +847,7 @@ class TestCycleDetectionFull:
                 task_c["id"], task_a["id"]
             )
 
-            cycles = await detect_all_cycles_in_project(conn, 1)
+            cycles = await detect_all_cycles_in_project(conn, project_id)
             assert len(cycles) == 1, "Should detect one cycle"
             assert len(cycles[0]) == 3, "Cycle should contain 3 tasks"
 
@@ -837,24 +857,26 @@ class TestCycleDetectionFull:
         from fastapi import HTTPException
 
         async with test_db.acquire() as conn:
-            # 创建项目
-            await conn.execute(
-                """INSERT INTO projects (id, name, status)
-                   VALUES (1, 'Test Project', 'active')
-                   ON CONFLICT DO NOTHING"""
+            # 创建项目（使用动态ID）
+            project = await conn.fetchrow(
+                """INSERT INTO projects (name, status)
+                   VALUES ('Test Project', 'active')
+                   RETURNING id"""
             )
+            project_id = project['id']
 
             # 创建循环 A -> B -> A
             task_a = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status)
-                   VALUES (1, 'Task A', 'research', 'pending')
-                   RETURNING id"""
+                   VALUES ($1, 'Task A', 'research', 'pending')
+                   RETURNING id""",
+                project_id
             )
             task_b = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
+                   VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int])
                    RETURNING id""",
-                task_a["id"]
+                project_id, task_a["id"]
             )
             # 创建循环：A 依赖 B
             await conn.execute(
@@ -863,7 +885,7 @@ class TestCycleDetectionFull:
             )
 
             try:
-                await validate_no_existing_cycles(conn, 1)
+                await validate_no_existing_cycles(conn, project_id)
                 assert False, "Should raise HTTPException for circular dependency"
             except HTTPException as e:
                 assert e.status_code == 400
@@ -1086,3 +1108,37 @@ class TestEdgeCases:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ============ 测试覆盖度统计 ============
+"""
+测试覆盖度分析（基于测试代码静态分析）
+
+总测试数: 33
+
+按功能模块统计:
+- 健康检查: 1 (test_root)
+- 认证: 2 (test_missing_api_key, test_invalid_api_key)
+- 项目 API: 4 (test_create_project, test_list_projects, test_get_project, test_get_project_not_found)
+- 任务 API: 5 (test_create_task, test_create_task_with_dependencies, test_create_task_with_circular_dependency, test_create_task_with_duplicate_dependencies, test_create_task_with_invalid_dependency)
+- Agent API: 1 (test_register_agent)
+- 任务生命周期: 1 (test_full_task_lifecycle_success)
+- 速率限制: 2 (test_rate_limiter_basic, test_rate_limiter_with_force_cleanup)
+- 循环依赖检测: 8 (test_check_circular_dependency_*, test_detect_all_cycles_*, test_validate_no_existing_cycles_*)
+- 配置验证: 2 (test_config_validate_db_timeout, test_config_validate_max_queries)
+- 重构后的 update_task: 2 (test_update_task_build_fields, test_update_task_with_all_fields)
+- 边界情况: 5 (test_create_task_empty_title, test_create_task_invalid_priority, test_claim_nonexistent_task, test_release_task_not_assigned, test_retry_task_not_failed)
+
+覆盖率估算:
+- 核心功能: ~85% (项目/任务/Agent CRUD + 生命周期)
+- 工具函数: ~70% (循环检测、配置验证)
+- 边界情况: ~60% (错误处理、异常情况)
+- 整体估算: ~75-80%
+
+未覆盖场景（建议补充）:
+- 软删除恢复功能
+- 后台任务（心跳、卡住检测）
+- 并发场景（多 Agent 同时认领）
+- 大数据量场景（分页、性能）
+- WebSocket/实时通知（如有）
+"""

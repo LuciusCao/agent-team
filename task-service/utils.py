@@ -390,14 +390,14 @@ async def detect_all_cycles_in_project(conn: asyncpg.Connection, project_id: int
         project_id
     )
 
-    # 构建图
+    # 先收集所有任务ID
+    task_ids = set(row['id'] for row in rows)
+
+    # 构建图（只保留项目中存在的任务依赖）
     graph = {}
-    task_ids = set()
     for row in rows:
         task_id = row['id']
-        task_ids.add(task_id)
         deps = row['dependencies'] or []
-        # 只保留项目中存在的任务依赖
         graph[task_id] = [d for d in deps if d in task_ids]
 
     # Tarjan 算法找强连通分量
