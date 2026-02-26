@@ -303,53 +303,6 @@ def validate_task_dependencies_for_create(dependencies: list[int]) -> None:
             raise HTTPException(status_code=400, detail=f"Invalid dependency ID: {dep_id}")
 
 
-async def check_circular_dependency(conn: asyncpg.Connection, task_id: int | None, new_deps: list[int]) -> bool:
-    """检查添加新依赖是否会形成循环
-
-    使用 BFS 遍历依赖图，检测是否会回到当前任务或形成任何循环。
-
-    Args:
-        conn: 数据库连接
-        task_id: 当前任务ID（新建任务时为 None）
-        new_deps: 新依赖的任务ID列表
-
-    Returns:
-        bool: 如果会形成循环返回 True
-    """
-    if not new_deps:
-        return False
-
-    visited = set()
-    queue = list(new_deps)
-
-    while queue:
-        dep_id = queue.pop(0)
-
-        # 如果依赖指向当前任务，形成循环
-        if task_id is not None and dep_id == task_id:
-            return True
-
-        # 如果已经在访问过的集合中，说明有循环
-        if dep_id in visited:
-            return True
-
-        visited.add(dep_id)
-
-        # 查询该任务的依赖
-        try:
-            row = await conn.fetchrow(
-                "SELECT dependencies FROM tasks WHERE id = $1 AND deleted_at IS NULL",
-                dep_id
-            )
-            if row and row['dependencies']:
-                queue.extend(row['dependencies'])
-        except Exception:
-            # 如果查询失败（如任务不存在），继续检查其他依赖
-            pass
-
-    return False
-
-
 # ============ Agent Utilities ============
 
 async def update_agent_status_after_task_change(conn: asyncpg.Connection, agent_name: str):
@@ -491,9 +444,8 @@ class RateLimiter:
         self.max_store_size = max_store_size
         self.store = {}
         self._last_cleanup_time = 0
-        self._lock = asyncio.Lock()  # 添加锁保证线程安全
 
-    async def _cleanup_if_needed(self, current_time: float) -> None:
+    def _cleanup_if_needed(self, current_time: float) -> None:
         """定期清理过期记录，防止内存泄漏"""
         if len(self.store) < self.max_store_size and current_time - self._last_cleanup_time < self.window:
             return
@@ -509,7 +461,7 @@ class RateLimiter:
 
         self._last_cleanup_time = current_time
 
-    async def is_allowed(self, key: str) -> bool:
+    def is_allowed(self, key: str) -> bool:
         """检查是否允许请求
 
         Args:
@@ -518,50 +470,29 @@ class RateLimiter:
         Returns:
             bool: 是否允许
         """
-        async with self._lock:
-            current_time = datetime.now().timestamp()
+        current_time = datetime.now().timestamp()
 
-            # 定期清理过期记录
-            await self._cleanup_if_needed(current_time)
+        # 定期清理过期记录
+        self._cleanup_if_needed(current_time)
 
-            # 检查存储上限，防止内存无限增长
-            if len(self.store) >= self.max_store_size:
-                # 强制清理一半最老的记录
-                await self._force_cleanup_oldest()
+        # 清理过期记录
+        if key in self.store:
+            self.store[key] = [
+                ts for ts in self.store[key]
+                if current_time - ts < self.window
+            ]
+        else:
+            self.store[key] = []
 
-            # 清理过期记录
-            if key in self.store:
-                self.store[key] = [
-                    ts for ts in self.store[key]
-                    if current_time - ts < self.window
-                ]
-            else:
-                self.store[key] = []
+        # 检查是否超过限制
+        if len(self.store[key]) >= self.max_requests:
+            return False
 
-            # 检查是否超过限制
-            if len(self.store[key]) >= self.max_requests:
-                return False
+        # 记录本次请求
+        self.store[key].append(current_time)
+        return True
 
-            # 记录本次请求
-            self.store[key].append(current_time)
-            return True
-
-    async def _force_cleanup_oldest(self) -> None:
-        """强制清理最老的记录（当达到存储上限时）"""
-        # 按最后访问时间排序，清理一半
-        sorted_keys = sorted(
-            self.store.keys(),
-            key=lambda k: max(self.store[k]) if self.store[k] else 0
-        )
-        keys_to_remove = sorted_keys[:len(sorted_keys) // 2]
-        for key in keys_to_remove:
-            del self.store[key]
-        logger.warning(
-            f"RateLimiter force cleanup: removed {len(keys_to_remove)} keys",
-            extra={"action": "rate_limiter_force_cleanup", "removed": len(keys_to_remove)}
-        )
-
-    async def get_remaining(self, key: str) -> int:
+    def get_remaining(self, key: str) -> int:
         """获取剩余请求数
 
         Args:
@@ -570,19 +501,18 @@ class RateLimiter:
         Returns:
             int: 剩余请求数
         """
-        async with self._lock:
-            current_time = datetime.now().timestamp()
+        current_time = datetime.now().timestamp()
 
-            if key not in self.store:
-                return self.max_requests
+        if key not in self.store:
+            return self.max_requests
 
-            # 清理过期记录
-            valid_requests = [
-                ts for ts in self.store[key]
-                if current_time - ts < self.window
-            ]
+        # 清理过期记录
+        valid_requests = [
+            ts for ts in self.store[key]
+            if current_time - ts < self.window
+        ]
 
-            return max(0, self.max_requests - len(valid_requests))
+        return max(0, self.max_requests - len(valid_requests))
 
 
 # ============ Validation Utilities ============
