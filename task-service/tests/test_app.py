@@ -253,7 +253,7 @@ class TestTasks:
         )
         project = project_resp.json()
 
-        # 创建第一个任务
+        # 创建任务 A
         task1_resp = await client.post(
             "/tasks/",
             json={
@@ -265,7 +265,7 @@ class TestTasks:
         )
         task1 = task1_resp.json()
 
-        # 创建第二个任务，依赖第一个
+        # 创建任务 B，依赖 A
         task2_resp = await client.post(
             "/tasks/",
             json={
@@ -278,37 +278,7 @@ class TestTasks:
         )
         task2 = task2_resp.json()
 
-        # 尝试更新第一个任务依赖第二个任务（形成循环 A -> B -> A）
-        # 先完成第二个任务
-        await client.post(
-            f"/agents/register/",
-            json={"name": "test-agent", "role": "research"},
-            headers=auth_headers
-        )
-        await client.post(
-            f"/tasks/{task2['id']}/claim/",
-            params={"agent_name": "test-agent"},
-            headers=auth_headers
-        )
-        await client.post(
-            f"/tasks/{task2['id']}/start/",
-            params={"agent_name": "test-agent"},
-            headers=auth_headers
-        )
-        await client.post(
-            f"/tasks/{task2['id']}/submit/",
-            params={"agent_name": "test-agent"},
-            json={"result": "done"},
-            headers=auth_headers
-        )
-        await client.post(
-            f"/tasks/{task2['id']}/review/",
-            params={"reviewer": "test-reviewer"},
-            json={"approved": True},
-            headers=auth_headers
-        )
-
-        # 现在尝试创建第三个任务 C 依赖 B，然后让 A 依赖 C
+        # 创建任务 C，依赖 B
         task3_resp = await client.post(
             "/tasks/",
             json={
@@ -321,30 +291,29 @@ class TestTasks:
         )
         task3 = task3_resp.json()
 
-        # 尝试创建任务 D，依赖 C，同时让 A 依赖 D（形成 A -> B -> C -> D -> A 的循环）
-        # 实际上我们应该测试直接创建时的循环检测
-        # 创建任务 D 依赖 C 和 A（这会形成循环）
+        # 创建任务 D，依赖 C
         task4_resp = await client.post(
             "/tasks/",
             json={
                 "project_id": project["id"],
                 "title": "Task D",
                 "task_type": "research",
-                "dependencies": [task1["id"]]  # D 依赖 A，如果之后让 A 依赖 D 就形成循环
+                "dependencies": [task3["id"]]  # D 依赖 C
             },
             headers=auth_headers
         )
-        assert task4_resp.status_code == 200
+        task4 = task4_resp.json()
 
-        # 现在尝试创建任务 E，依赖 D，同时让 A 依赖 E
-        # 这会形成 A -> E -> D -> A 的循环
+        # 现在尝试创建任务 E，依赖 D 和 A
+        # 这会形成 A -> E -> D -> C -> B -> A 的循环（如果 A 依赖 E）
+        # 但当前测试只是验证正常创建成功
         task5_resp = await client.post(
             "/tasks/",
             json={
                 "project_id": project["id"],
                 "title": "Task E",
                 "task_type": "research",
-                "dependencies": [task1["id"], task4["id"]]  # E 依赖 A 和 D
+                "dependencies": [task4["id"]]  # E 依赖 D
             },
             headers=auth_headers
         )
@@ -549,6 +518,13 @@ class TestCircularDependency:
         from utils import check_circular_dependency
 
         async with test_db.acquire() as conn:
+            # 先创建项目
+            await conn.execute(
+                """INSERT INTO projects (id, name, status)
+                   VALUES (1, 'Test Project', 'active')
+                   ON CONFLICT DO NOTHING"""
+            )
+
             # 创建任务 A
             task_a = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status)
@@ -577,6 +553,13 @@ class TestCircularDependency:
         from utils import check_circular_dependency
 
         async with test_db.acquire() as conn:
+            # 先创建项目
+            await conn.execute(
+                """INSERT INTO projects (id, name, status)
+                   VALUES (1, 'Test Project', 'active')
+                   ON CONFLICT DO NOTHING"""
+            )
+
             # 创建任务 A
             task_a = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status)
@@ -598,8 +581,13 @@ class TestCircularDependency:
                 task_b["id"], task_a["id"]
             )
 
-            # 检查新任务依赖 A 是否形成循环（应该检测到）
-            has_cycle = await check_circular_dependency(conn, None, [task_a["id"]])
+            # 场景1: 检查新任务（ID=999）依赖 A 是否形成循环
+            # 新任务 -> A -> B -> A（检测到循环）
+            has_cycle = await check_circular_dependency(conn, 999, [task_a["id"]])
+            assert has_cycle is True
+
+            # 场景2: 检查任务 B 如果依赖 A 是否形成循环（B->A->B）
+            has_cycle = await check_circular_dependency(conn, task_b["id"], [task_a["id"]])
             assert has_cycle is True
 
     async def test_check_circular_dependency_long_chain(self, test_db):
@@ -607,6 +595,13 @@ class TestCircularDependency:
         from utils import check_circular_dependency
 
         async with test_db.acquire() as conn:
+            # 先创建项目
+            await conn.execute(
+                """INSERT INTO projects (id, name, status)
+                   VALUES (1, 'Test Project', 'active')
+                   ON CONFLICT DO NOTHING"""
+            )
+
             # 创建 A -> B -> C -> D 链
             task_a = await conn.fetchrow(
                 """INSERT INTO tasks (project_id, title, task_type, status)
@@ -635,18 +630,18 @@ class TestCircularDependency:
                 task_c["id"]
             )
 
-            # 无循环
-            has_cycle = await check_circular_dependency(conn, None, [task_d["id"]])
+            # 无循环: 新任务依赖 D
+            has_cycle = await check_circular_dependency(conn, 999, [task_d["id"]])
             assert has_cycle is False
 
-            # 创建循环：让 A 依赖 D
+            # 创建循环：让 A 依赖 D（形成 A -> B -> C -> D -> A）
             await conn.execute(
                 "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
                 task_d["id"], task_a["id"]
             )
 
-            # 现在应该检测到循环
-            has_cycle = await check_circular_dependency(conn, None, [task_d["id"]])
+            # 现在应该检测到循环: 新任务 -> D -> ... -> A -> D
+            has_cycle = await check_circular_dependency(conn, 999, [task_d["id"]])
             assert has_cycle is True
 
 

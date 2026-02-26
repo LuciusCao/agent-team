@@ -306,7 +306,7 @@ def validate_task_dependencies_for_create(dependencies: list[int]) -> None:
 async def check_circular_dependency(conn: asyncpg.Connection, task_id: int | None, new_deps: list[int]) -> bool:
     """检查添加新依赖是否会形成循环
 
-    使用 BFS 遍历依赖图，检测是否会回到当前任务。
+    使用 BFS 遍历依赖图，检测是否会回到当前任务或形成任何循环。
 
     Args:
         conn: 数据库连接
@@ -329,8 +329,10 @@ async def check_circular_dependency(conn: asyncpg.Connection, task_id: int | Non
         if task_id is not None and dep_id == task_id:
             return True
 
+        # 如果已经在访问过的集合中，说明有循环
         if dep_id in visited:
-            continue
+            return True
+
         visited.add(dep_id)
 
         # 查询该任务的依赖
