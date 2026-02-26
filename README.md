@@ -166,7 +166,9 @@ agent-team/
 │   │   └── channels.py      # 频道 API
 │   ├── schema.sql           # 数据库 Schema
 │   ├── docker-compose.yml
-│   └── DEPLOYMENT.md        # 部署指南
+│   ├── DEPLOYMENT.md        # 部署指南
+│   ├── CHANGELOG.md         # 版本变更记录
+│   └── tests/               # 测试套件
 ├── skills/                  # Agent Skills
 │   ├── agent-manager/       # Agent 管理（注册/移除/查询）
 │   ├── project-manager/     # 项目管理（创建/拆分/监控）
@@ -248,12 +250,6 @@ Task Service 提供完整的 REST API 用于任务管理。详细 API 文档请�
 | 仪表盘 | `/v1/dashboard/stats` |
 
 API 文档（Swagger UI）：http://localhost:8080/docs
-
-## Skills
-curl -X POST "http://localhost:8080/tasks/1/review?reviewer=coordinator" \
-  -H "Content-Type: application/json" \
-  -d '{"approved": true, "feedback": "质量很好"}'
-```
 
 ## Skills
 
@@ -643,6 +639,14 @@ A: Agent 使用 `task-manager` skill 轮询 `/tasks/available-for/{agent_name}`
 - [ ] 更多项目模板
 - [ ] Agent 绩效分析
 - [ ] 动态优先级调整
+
+## 相关文档
+
+- [Task Service 详细文档](task-service/README.md)
+- [开发工具脚本](task-service/scripts/README.md)
+- [测试文档](task-service/tests/README.md)
+- [部署指南](task-service/DEPLOYMENT.md)
+- [版本变更记录](task-service/CHANGELOG.md)
 
 ## License
 
