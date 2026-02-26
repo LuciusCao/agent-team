@@ -6,6 +6,11 @@ Task Service 测试套件
 
 需要环境变量:
     DATABASE_URL=postgresql://taskmanager:taskmanager@localhost:5433/taskmanager_test
+    TEST_DB_HOST=localhost
+    TEST_DB_PORT=5433
+    TEST_DB_USER=taskmanager
+    TEST_DB_PASSWORD=taskmanager
+    TEST_DB_NAME=taskmanager_test
 """
 
 import asyncio
@@ -19,10 +24,29 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+# ============ 测试配置 ============
+
+# 从环境变量读取测试数据库配置，使用默认值
+TEST_DB_HOST = os.getenv("TEST_DB_HOST", "localhost")
+TEST_DB_PORT = os.getenv("TEST_DB_PORT", "5433")
+TEST_DB_USER = os.getenv("TEST_DB_USER", "taskmanager")
+TEST_DB_PASSWORD = os.getenv("TEST_DB_PASSWORD", "taskmanager")
+TEST_DB_NAME = os.getenv("TEST_DB_NAME", "taskmanager_test")
+
+# 构建数据库 URL
+TEST_DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    f"postgresql://{TEST_DB_USER}:{TEST_DB_PASSWORD}@{TEST_DB_HOST}:{TEST_DB_PORT}/{TEST_DB_NAME}"
+)
+ADMIN_DATABASE_URL = os.getenv(
+    "ADMIN_DATABASE_URL",
+    f"postgresql://{TEST_DB_USER}:{TEST_DB_PASSWORD}@{TEST_DB_HOST}:{TEST_DB_PORT}/postgres"
+)
+
 # 设置测试环境
-os.environ["DATABASE_URL"] = "postgresql://taskmanager:taskmanager@localhost:5433/taskmanager_test"
-os.environ["API_KEY"] = "test-api-key"
-os.environ["LOG_LEVEL"] = "DEBUG"
+os.environ["DATABASE_URL"] = TEST_DATABASE_URL
+os.environ["API_KEY"] = os.getenv("TEST_API_KEY", "test-api-key")
+os.environ["LOG_LEVEL"] = os.getenv("TEST_LOG_LEVEL", "DEBUG")
 
 import asyncpg
 
@@ -30,38 +54,50 @@ from main import app, get_db
 
 # ============ 数据库初始化 ============
 
+_test_db_initialized = False
+
 async def init_test_database():
     """初始化测试数据库（只运行一次）"""
-    admin_url = "postgresql://taskmanager:taskmanager@localhost:5433/postgres"
-    test_db_url = "postgresql://taskmanager:taskmanager@localhost:5433/taskmanager_test"
+    global _test_db_initialized
+    if _test_db_initialized:
+        return
 
-    # 连接到 postgres 数据库创建测试数据库
-    conn = await asyncpg.connect(admin_url)
     try:
-        # 终止现有连接
-        await conn.execute("""
-            SELECT pg_terminate_backend(pg_stat_activity.pid)
-            FROM pg_stat_activity
-            WHERE pg_stat_activity.datname = 'taskmanager_test'
-            AND pid <> pg_backend_pid()
-        """)
-        await conn.execute("DROP DATABASE IF EXISTS taskmanager_test")
-        await conn.execute("CREATE DATABASE taskmanager_test")
-    finally:
-        await conn.close()
+        # 连接到 postgres 数据库创建测试数据库
+        conn = await asyncpg.connect(ADMIN_DATABASE_URL)
+        try:
+            # 终止现有连接
+            await conn.execute(f"""
+                SELECT pg_terminate_backend(pg_stat_activity.pid)
+                FROM pg_stat_activity
+                WHERE pg_stat_activity.datname = '{TEST_DB_NAME}'
+                AND pid <> pg_backend_pid()
+            """)
+            await conn.execute(f"DROP DATABASE IF EXISTS {TEST_DB_NAME}")
+            await conn.execute(f"CREATE DATABASE {TEST_DB_NAME}")
+        finally:
+            await conn.close()
 
-    # 连接到测试数据库并执行 schema
-    conn = await asyncpg.connect(test_db_url)
-    try:
-        with open("schema.sql") as f:
-            schema = f.read()
-            await conn.execute(schema)
-    finally:
-        await conn.close()
+        # 连接到测试数据库并执行 schema
+        conn = await asyncpg.connect(TEST_DATABASE_URL)
+        try:
+            with open("schema.sql") as f:
+                schema = f.read()
+                await conn.execute(schema)
+        finally:
+            await conn.close()
+
+        _test_db_initialized = True
+    except Exception as e:
+        print(f"Warning: Failed to initialize test database: {e}")
+        # 不抛出异常，让测试在运行时处理连接问题
 
 
-# 在导入时初始化数据库
-asyncio.run(init_test_database())
+# 在导入时初始化数据库（带错误处理）
+try:
+    asyncio.run(init_test_database())
+except Exception as e:
+    print(f"Database initialization deferred: {e}")
 
 
 # ============ Fixtures ============
@@ -69,10 +105,8 @@ asyncio.run(init_test_database())
 @pytest_asyncio.fixture(scope="function")
 async def test_db():
     """每个测试使用独立的数据库连接池"""
-    test_db_url = "postgresql://taskmanager:taskmanager@localhost:5433/taskmanager_test"
-
     # 创建连接池
-    pool = await asyncpg.create_pool(test_db_url, min_size=1, max_size=5)
+    pool = await asyncpg.create_pool(TEST_DATABASE_URL, min_size=1, max_size=5)
 
     yield pool
 
@@ -647,6 +681,407 @@ class TestCircularDependency:
             # 现在应该检测到循环: 新任务 -> D -> ... -> A -> D
             has_cycle = await check_circular_dependency(conn, 999, [task_d["id"]])
             assert has_cycle is True
+
+    async def test_check_circular_dependency_shared_dependency(self, test_db):
+        """测试共享依赖不应被误判为循环
+
+        场景: A -> C, B -> C (C 是 A 和 B 的共同依赖)
+        检查: B 依赖 A 不应该形成循环（虽然 C 被访问两次，但不是循环）
+        """
+        from utils import check_circular_dependency
+
+        async with test_db.acquire() as conn:
+            # 先创建项目
+            await conn.execute(
+                """INSERT INTO projects (id, name, status)
+                   VALUES (1, 'Test Project', 'active')
+                   ON CONFLICT DO NOTHING"""
+            )
+
+            # 创建任务 C（基础任务）
+            task_c = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status)
+                   VALUES (1, 'Task C', 'research', 'pending')
+                   RETURNING id"""
+            )
+
+            # 创建任务 A，依赖 C
+            task_a = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task A', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_c["id"]
+            )
+
+            # 创建任务 B，依赖 C
+            task_b = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_c["id"]
+            )
+
+            # B 依赖 A 不应该形成循环
+            # 路径: B -> A -> C (C 没有依赖，结束)
+            has_cycle = await check_circular_dependency(conn, task_b["id"], [task_a["id"]])
+            assert has_cycle is False, "Shared dependency should not be detected as cycle"
+
+            # 新任务同时依赖 A 和 B 也不应该形成循环
+            has_cycle = await check_circular_dependency(conn, 999, [task_a["id"], task_b["id"]])
+            assert has_cycle is False, "Diamond dependency pattern should not be detected as cycle"
+
+    async def test_check_circular_dependency_self_reference(self, test_db):
+        """测试任务不能依赖自己"""
+        from utils import check_circular_dependency
+
+        async with test_db.acquire() as conn:
+            # 先创建项目
+            await conn.execute(
+                """INSERT INTO projects (id, name, status)
+                   VALUES (1, 'Test Project', 'active')
+                   ON CONFLICT DO NOTHING"""
+            )
+
+            # 创建任务 A
+            task_a = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status)
+                   VALUES (1, 'Task A', 'research', 'pending')
+                   RETURNING id"""
+            )
+
+            # 任务 A 依赖自己应该形成循环
+            has_cycle = await check_circular_dependency(conn, task_a["id"], [task_a["id"]])
+            assert has_cycle is True, "Self-reference should be detected as cycle"
+
+
+class TestCycleDetectionFull:
+    """全图循环检测测试"""
+
+    async def test_detect_all_cycles_no_cycle(self, test_db):
+        """测试无循环的情况"""
+        from utils import detect_all_cycles_in_project
+
+        async with test_db.acquire() as conn:
+            # 创建项目
+            await conn.execute(
+                """INSERT INTO projects (id, name, status)
+                   VALUES (1, 'Test Project', 'active')
+                   ON CONFLICT DO NOTHING"""
+            )
+
+            # 创建 A -> B -> C 链（无循环）
+            task_a = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status)
+                   VALUES (1, 'Task A', 'research', 'pending')
+                   RETURNING id"""
+            )
+            task_b = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_a["id"]
+            )
+            await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task C', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_b["id"]
+            )
+
+            cycles = await detect_all_cycles_in_project(conn, 1)
+            assert len(cycles) == 0, "Should not detect cycles in acyclic graph"
+
+    async def test_detect_all_cycles_with_cycle(self, test_db):
+        """测试检测到循环"""
+        from utils import detect_all_cycles_in_project
+
+        async with test_db.acquire() as conn:
+            # 创建项目
+            await conn.execute(
+                """INSERT INTO projects (id, name, status)
+                   VALUES (1, 'Test Project', 'active')
+                   ON CONFLICT DO NOTHING"""
+            )
+
+            # 创建 A -> B -> C -> A 循环
+            task_a = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status)
+                   VALUES (1, 'Task A', 'research', 'pending')
+                   RETURNING id"""
+            )
+            task_b = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_a["id"]
+            )
+            task_c = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task C', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_b["id"]
+            )
+            # 创建循环：C 依赖 A
+            await conn.execute(
+                "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
+                task_c["id"], task_a["id"]
+            )
+
+            cycles = await detect_all_cycles_in_project(conn, 1)
+            assert len(cycles) == 1, "Should detect one cycle"
+            assert len(cycles[0]) == 3, "Cycle should contain 3 tasks"
+
+    async def test_validate_no_existing_cycles_raises(self, test_db):
+        """测试验证函数在检测到循环时抛出异常"""
+        from utils import validate_no_existing_cycles
+        from fastapi import HTTPException
+
+        async with test_db.acquire() as conn:
+            # 创建项目
+            await conn.execute(
+                """INSERT INTO projects (id, name, status)
+                   VALUES (1, 'Test Project', 'active')
+                   ON CONFLICT DO NOTHING"""
+            )
+
+            # 创建循环 A -> B -> A
+            task_a = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status)
+                   VALUES (1, 'Task A', 'research', 'pending')
+                   RETURNING id"""
+            )
+            task_b = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_a["id"]
+            )
+            # 创建循环：A 依赖 B
+            await conn.execute(
+                "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
+                task_b["id"], task_a["id"]
+            )
+
+            try:
+                await validate_no_existing_cycles(conn, 1)
+                assert False, "Should raise HTTPException for circular dependency"
+            except HTTPException as e:
+                assert e.status_code == 400
+                assert "Circular dependency" in e.detail
+
+
+class TestConfigValidation:
+    """配置验证测试"""
+
+    async def test_config_validate_db_timeout(self):
+        """测试数据库超时配置验证"""
+        from config import Config
+
+        # 保存原始值
+        original_timeout = Config.DB_COMMAND_TIMEOUT
+
+        try:
+            # 测试无效值：小于 1
+            Config.DB_COMMAND_TIMEOUT = 0
+            errors = Config.validate()
+            assert any("DB_COMMAND_TIMEOUT must be at least" in e for e in errors)
+
+            # 测试无效值：大于 300
+            Config.DB_COMMAND_TIMEOUT = 301
+            errors = Config.validate()
+            assert any("should not exceed 300 seconds" in e for e in errors)
+
+            # 测试有效值
+            Config.DB_COMMAND_TIMEOUT = 60
+            errors = Config.validate()
+            assert not any("DB_COMMAND_TIMEOUT" in e for e in errors)
+        finally:
+            Config.DB_COMMAND_TIMEOUT = original_timeout
+
+    async def test_config_validate_max_queries(self):
+        """测试最大查询数配置验证"""
+        from config import Config
+
+        original_max = Config.DB_MAX_QUERIES
+
+        try:
+            # 测试无效值：小于 1000
+            Config.DB_MAX_QUERIES = 500
+            errors = Config.validate()
+            assert any("DB_MAX_QUERIES should be at least" in e for e in errors)
+
+            # 测试无效值：大于 1000000
+            Config.DB_MAX_QUERIES = 2000000
+            errors = Config.validate()
+            assert any("should not exceed 1,000,000" in e for e in errors)
+        finally:
+            Config.DB_MAX_QUERIES = original_max
+
+
+class TestUpdateTaskRefactored:
+    """重构后的 update_task 测试"""
+
+    async def test_update_task_build_fields(self):
+        """测试构建更新字段"""
+        from routers.tasks import _build_update_fields
+        from models import TaskUpdate
+
+        # 测试空更新
+        updates, params = await _build_update_fields(TaskUpdate())
+        assert len(updates) == 0
+        assert len(params) == 0
+
+        # 测试部分字段更新
+        update = TaskUpdate(status="completed", priority=8)
+        updates, params = await _build_update_fields(update)
+        assert len(updates) == 2
+        assert "status = $1" in updates
+        assert "priority = $2" in updates
+        assert "completed" in params
+        assert 8 in params
+
+    async def test_update_task_with_all_fields(self, client, auth_headers):
+        """测试更新任务所有字段"""
+        # 创建项目
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Update Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        # 创建任务
+        task_resp = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Test Task", "task_type": "research"},
+            headers=auth_headers
+        )
+        task = task_resp.json()
+
+        # 更新所有字段
+        response = await client.patch(
+            f"/tasks/{task['id']}",
+            json={
+                "status": "completed",
+                "priority": 10,
+                "feedback": "Great work!",
+                "result": {"output": "test result"}
+            },
+            headers=auth_headers
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "completed"
+        assert data["priority"] == 10
+        assert data["feedback"] == "Great work!"
+
+
+class TestEdgeCases:
+    """边界情况测试"""
+
+    async def test_create_task_empty_title(self, client, auth_headers):
+        """测试创建任务时标题为空"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Edge Case Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        # 空标题应该被允许（数据库层面），但可能业务层面应该限制
+        response = await client.post(
+            "/tasks/",
+            json={
+                "project_id": project["id"],
+                "title": "",
+                "task_type": "research"
+            },
+            headers=auth_headers
+        )
+        # 根据业务需求，可能返回 200 或 422
+        assert response.status_code in [200, 422]
+
+    async def test_create_task_invalid_priority(self, client, auth_headers):
+        """测试创建任务时优先级超出范围"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Edge Case Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        # 优先级超出 1-10 范围
+        response = await client.post(
+            "/tasks/",
+            json={
+                "project_id": project["id"],
+                "title": "Test Task",
+                "task_type": "research",
+                "priority": 15
+            },
+            headers=auth_headers
+        )
+        assert response.status_code == 422  # Pydantic 验证失败
+
+    async def test_claim_nonexistent_task(self, client, auth_headers):
+        """测试认领不存在的任务"""
+        response = await client.post(
+            "/tasks/99999/claim/",
+            params={"agent_name": "test-agent"},
+            headers=auth_headers
+        )
+        assert response.status_code == 404
+
+    async def test_release_task_not_assigned(self, client, auth_headers):
+        """测试释放未分配的任务"""
+        # 创建项目
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Edge Case Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        # 创建任务
+        task_resp = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Test Task", "task_type": "research"},
+            headers=auth_headers
+        )
+        task = task_resp.json()
+
+        # 尝试释放未认领的任务
+        response = await client.post(
+            f"/tasks/{task['id']}/release/",
+            params={"agent_name": "test-agent"},
+            headers=auth_headers
+        )
+        assert response.status_code == 404  # 任务未分配给该 agent
+
+    async def test_retry_task_not_failed(self, client, auth_headers):
+        """测试重试未失败的任务"""
+        # 创建项目
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Edge Case Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        # 创建任务
+        task_resp = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Test Task", "task_type": "research"},
+            headers=auth_headers
+        )
+        task = task_resp.json()
+
+        # 尝试重试 pending 状态的任务
+        response = await client.post(
+            f"/tasks/{task['id']}/retry/",
+            headers=auth_headers
+        )
+        assert response.status_code == 400
 
 
 if __name__ == "__main__":

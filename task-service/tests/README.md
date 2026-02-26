@@ -2,17 +2,40 @@
 
 ## 运行测试
 
-### 安装依赖
+### 使用 uv（推荐）
+
+```bash
+cd task-service
+
+# 运行所有测试
+uv run pytest tests/ -v
+
+# 特定测试
+uv run pytest tests/ -k test_name
+
+# 覆盖率
+uv run pytest tests/ --cov=. --cov-report=html
+```
+
+### 使用 pip
 
 ```bash
 cd task-service
 pip install pytest pytest-asyncio httpx pytest-cov
+pytest tests/ -v
 ```
 
-### 运行所有测试
+### 使用开发脚本
 
 ```bash
-pytest tests/ -v
+# 运行所有测试
+./scripts/dev.sh test
+
+# 详细输出
+./scripts/dev.sh test -v
+
+# 覆盖率报告
+./scripts/dev.sh test --cov
 ```
 
 ### 运行特定测试
@@ -64,12 +87,10 @@ pytest tests/ -v -n auto
 | `TestTasks` | 任务 CRUD、认领 | 高 |
 | `TestTaskLifecycle` | 完整任务状态流转 | 高 |
 | `TestTaskDependencies` | 任务依赖检查 | 高 |
-| `TestConcurrency` | 并发和竞态条件 | 中 |
-| `TestIdempotency` | 幂等性保证 | 高 |
-| `TestAgents` | Agent 注册、心跳 | 中 |
+| `TestCircularDependency` | 循环依赖检测 | 高 |
+| `TestRateLimiter` | 速率限制器 | 中 |
+| `TestAgents` | Agent 注册 | 中 |
 | `TestAuth` | API 认证 | 高 |
-| `TestRateLimit` | 速率限制 | 中 |
-| `TestTimeouts` | 超时配置 | 中 |
 
 ## 测试覆盖范围
 
@@ -77,19 +98,26 @@ pytest tests/ -v -n auto
 
 覆盖完整的任务状态流转：
 - `test_full_task_lifecycle_success`: pending → assigned → running → reviewing → completed
-- `test_task_lifecycle_rejected`: pending → assigned → running → reviewing → rejected → pending
-- `test_cannot_start_without_claim`: 验证未认领不能开始
-- `test_cannot_submit_without_start`: 验证未开始不能提交
-- `test_release_task`: 验证任务释放
 
-### 任务依赖测试 (TestTaskDependencies)
+### 任务依赖测试 (TestTasks)
 
-- `test_cannot_claim_with_unfinished_deps`: 依赖未完成时不能认领
-- `test_circular_dependencies_detection`: 循环依赖检测
+- `test_create_task_with_dependencies`: 创建带依赖的任务
+- `test_create_task_with_circular_dependency`: 循环依赖检测（API 层面）
+- `test_create_task_with_duplicate_dependencies`: 重复依赖检测
+- `test_create_task_with_invalid_dependency`: 无效依赖检测
 
-### 并发测试 (TestConcurrency)
+### 循环依赖检测测试 (TestCircularDependency)
 
-- `test_claim_race_condition`: 验证认领竞态条件（只有一个 Agent 能成功）
+- `test_check_circular_dependency_no_cycle`: 无循环依赖的场景
+- `test_check_circular_dependency_with_cycle`: 有循环依赖的场景
+- `test_check_circular_dependency_long_chain`: 长依赖链的循环检测
+- `test_check_circular_dependency_shared_dependency`: **共享依赖不应被误判为循环**（菱形结构）
+- `test_check_circular_dependency_self_reference`: 任务不能依赖自己
+
+### 速率限制器测试 (TestRateLimiter)
+
+- `test_rate_limiter_basic`: 基础限流功能
+- `test_rate_limiter_with_force_cleanup`: 强制清理机制（防止内存泄漏）
 
 ## 添加新测试
 

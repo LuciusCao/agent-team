@@ -459,91 +459,135 @@ async def get_task(task_id: int, db=Depends(get_db)):
     return {"task": dict(task), "logs": [dict(log) for log in logs]}
 
 
+async def _build_update_fields(update: TaskUpdate) -> tuple[list[str], list]:
+    """构建更新字段列表和参数列表"""
+    updates = []
+    params = []
+
+    if update.status is not None:
+        updates.append("status = $" + str(len(params) + 1))
+        params.append(update.status)
+
+    if update.result is not None:
+        updates.append("result = $" + str(len(params) + 1))
+        params.append(json.dumps(update.result))
+
+    if update.assignee_agent is not None:
+        updates.append("assignee_agent = $" + str(len(params) + 1))
+        params.append(update.assignee_agent)
+
+    if update.priority is not None:
+        updates.append("priority = $" + str(len(params) + 1))
+        params.append(update.priority)
+
+    if update.feedback is not None:
+        updates.append("feedback = $" + str(len(params) + 1))
+        params.append(update.feedback)
+
+    return updates, params
+
+
+async def _handle_status_change(
+    conn, task_id: int, current: dict, new_status: str
+) -> None:
+    """处理状态变更的副作用（Agent 统计更新）"""
+    assignee = current.get("assignee_agent")
+    if not assignee:
+        return
+
+    if new_status == "completed":
+        await conn.execute(
+            """
+            UPDATE agents
+            SET completed_tasks = completed_tasks + 1,
+                total_tasks = total_tasks + 1,
+                success_rate = (completed_tasks::FLOAT + 1) / NULLIF(total_tasks + 1, 0),
+                updated_at = NOW()
+            WHERE name = $1
+            """,
+            assignee
+        )
+        await update_agent_status_after_task_change(conn, assignee)
+    elif new_status == "failed":
+        await conn.execute(
+            """
+            UPDATE agents
+            SET failed_tasks = failed_tasks + 1,
+                total_tasks = total_tasks + 1,
+                success_rate = (completed_tasks::FLOAT) / NULLIF(total_tasks + 1, 0),
+                updated_at = NOW()
+            WHERE name = $1
+            """,
+            assignee
+        )
+        await update_agent_status_after_task_change(conn, assignee)
+
+
+async def _execute_task_update(
+    conn, task_id: int, updates: list[str], params: list, current_status: str
+) -> dict:
+    """执行数据库更新操作"""
+    if not updates:
+        return None
+
+    updates.append("updated_at = NOW()")
+    params.append(task_id)
+
+    query = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ${len(params)} AND deleted_at IS NULL RETURNING *"
+    return await conn.fetchrow(query, *params)
+
+
+async def _log_task_update(
+    conn, task_id: int, old_status: str, new_status: str, update_data: dict
+) -> None:
+    """记录任务更新日志"""
+    await conn.execute(
+        """
+        INSERT INTO task_logs (task_id, action, old_status, new_status, message)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        task_id, "status_changed", old_status, new_status or old_status,
+        f"Task updated: {update_data}"
+    )
+
+
 @router.patch("/{task_id}", dependencies=[Depends(verify_api_key), Depends(rate_limit)])
 async def update_task(task_id: int, update: TaskUpdate, db=Depends(get_db)):
+    """更新任务信息（重构后版本）
+
+    将原函数拆分为多个小函数，每个函数职责单一：
+    - _build_update_fields: 构建更新字段
+    - _handle_status_change: 处理状态变更副作用
+    - _execute_task_update: 执行数据库更新
+    - _log_task_update: 记录操作日志
+    """
     async with db.acquire() as conn:
         async with conn.transaction():
-            current = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1 AND deleted_at IS NULL", task_id)
+            # 1. 获取当前任务
+            current = await conn.fetchrow(
+                "SELECT * FROM tasks WHERE id = $1 AND deleted_at IS NULL", task_id
+            )
             if not current:
                 raise HTTPException(status_code=404, detail="Task not found")
 
-            updates = []
-            params = []
-            param_num = 1
+            # 2. 构建更新字段
+            updates, params = await _build_update_fields(update)
 
+            # 3. 处理状态变更副作用（在更新前处理，确保数据一致性）
             if update.status is not None:
-                updates.append(f"status = ${param_num}")
-                params.append(update.status)
-                param_num += 1
-
+                await _handle_status_change(conn, task_id, current, update.status)
                 if update.status == "completed":
                     updates.append("completed_at = NOW()")
 
-                    if current["assignee_agent"]:
-                        await conn.execute(
-                            """
-                            UPDATE agents
-                            SET completed_tasks = completed_tasks + 1,
-                                total_tasks = total_tasks + 1,
-                                success_rate = (completed_tasks::FLOAT + 1) / NULLIF(total_tasks + 1, 0),
-                                updated_at = NOW()
-                            WHERE name = $1
-                            """,
-                            current["assignee_agent"]
-                        )
-                        await update_agent_status_after_task_change(conn, current["assignee_agent"])
-                elif update.status == "failed":
-                    if current["assignee_agent"]:
-                        await conn.execute(
-                            """
-                            UPDATE agents
-                            SET failed_tasks = failed_tasks + 1,
-                                total_tasks = total_tasks + 1,
-                                success_rate = (completed_tasks::FLOAT) / NULLIF(total_tasks + 1, 0),
-                                updated_at = NOW()
-                            WHERE name = $1
-                            """,
-                            current["assignee_agent"]
-                        )
-                        await update_agent_status_after_task_change(conn, current["assignee_agent"])
-
-            if update.result is not None:
-                updates.append(f"result = ${param_num}")
-                params.append(json.dumps(update.result))
-                param_num += 1
-
-            if update.assignee_agent is not None:
-                updates.append(f"assignee_agent = ${param_num}")
-                params.append(update.assignee_agent)
-                param_num += 1
-
-            if update.priority is not None:
-                updates.append(f"priority = ${param_num}")
-                params.append(update.priority)
-                param_num += 1
-
-            if update.feedback is not None:
-                updates.append(f"feedback = ${param_num}")
-                params.append(update.feedback)
-                param_num += 1
-
-            if not updates:
+            # 4. 执行数据库更新
+            result = await _execute_task_update(conn, task_id, updates, params, current["status"])
+            if result is None:
                 return current
 
-            updates.append("updated_at = NOW()")
-            params.append(task_id)
-
-            query = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ${param_num} AND deleted_at IS NULL RETURNING *"
-
-            result = await conn.fetchrow(query, *params)
-
-            await conn.execute(
-                """
-                INSERT INTO task_logs (task_id, action, old_status, new_status, message)
-                VALUES ($1, $2, $3, $4, $5)
-                """,
-                task_id, "status_changed", current["status"], update.status or current["status"],
-                f"Task updated: {update.dict(exclude_none=True)}"
+            # 5. 记录操作日志
+            await _log_task_update(
+                conn, task_id, current["status"], update.status,
+                update.dict(exclude_none=True)
             )
 
     return result

@@ -203,6 +203,23 @@ pytest tests/ -k test_name
 pytest tests/ --cov=. --cov-report=html
 ```
 
+### 代码质量
+
+项目使用 [ruff](https://github.com/astral-sh/ruff) 进行代码检查和格式化：
+
+```bash
+# 代码检查
+./scripts/dev.sh lint
+
+# 自动修复问题
+./scripts/dev.sh lint --fix
+
+# 代码格式化
+./scripts/dev.sh format
+```
+
+脚本优先使用 `uv` 运行（如果已安装），否则回退到直接调用。
+
 ## 核心功能
 
 ### 任务生命周期
@@ -220,6 +237,38 @@ reviewing（待验收）
     └─▶ rejected（已拒绝）❌ ──▶ pending（重新认领）
 ```
 
+### 任务依赖管理
+
+支持创建带依赖关系的任务：
+
+```bash
+# 创建任务 A
+curl -X POST http://localhost:8080/v1/tasks \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{"project_id": 1, "title": "Task A", "task_type": "research"}'
+
+# 创建任务 B，依赖任务 A
+curl -X POST http://localhost:8080/v1/tasks \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{"project_id": 1, "title": "Task B", "task_type": "research", "dependencies": [1]}'
+```
+
+**依赖规则：**
+- 任务只能依赖同一项目内的其他任务
+- 支持多级依赖链（A → B → C → D）
+- **自动检测循环依赖**：系统会阻止创建形成循环的依赖关系
+- 只有依赖任务全部完成后，任务才能被认领
+
+**循环依赖检测示例：**
+```
+合法: A → B → C (线性链)
+合法: A → C, B → C (共享依赖，菱形结构)
+非法: A → B → A (循环)
+非法: A → B → C → A (间接循环)
+```
+
 ### 软删除
 
 所有主要实体（tasks, agents, projects）支持软删除：
@@ -234,6 +283,13 @@ reviewing（待验收）
 - **heartbeat_monitor**: 检测离线 Agent
 - **stuck_task_monitor**: 释放超时任务
 - **soft_delete_cleanup_monitor**: 清理过期软删除记录
+
+### 近期优化
+
+- **速率限制器**: 添加内存上限和强制清理机制，防止内存泄漏
+- **循环依赖检测**: 优化算法，避免误判共享依赖为循环
+- **优雅关闭**: 支持后台任务可中断关闭
+- **数据库连接池**: 添加错误计数器，避免频繁重置
 
 ## 常见问题
 

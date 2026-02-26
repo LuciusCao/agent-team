@@ -306,7 +306,9 @@ def validate_task_dependencies_for_create(dependencies: list[int]) -> None:
 async def check_circular_dependency(conn: asyncpg.Connection, task_id: int | None, new_deps: list[int]) -> bool:
     """检查添加新依赖是否会形成循环
 
-    使用 BFS 遍历依赖图，检测是否会回到当前任务或形成任何循环。
+    使用 BFS 遍历依赖图，检测是否会回到当前任务形成循环。
+    注意：此函数只检测是否会回到 task_id，不检测依赖图中其他循环
+    （其他循环应该在任务创建时就被阻止）。
 
     Args:
         conn: 数据库连接
@@ -319,35 +321,147 @@ async def check_circular_dependency(conn: asyncpg.Connection, task_id: int | Non
     if not new_deps:
         return False
 
+    # 使用 DFS 检测是否会回到当前任务
+    # visited 用于避免重复访问同一分支，不用于检测循环
     visited = set()
-    queue = list(new_deps)
+    # 当前遍历路径上的节点，用于检测循环
+    path = set()
 
-    while queue:
-        dep_id = queue.pop(0)
-
-        # 如果依赖指向当前任务，形成循环
-        if task_id is not None and dep_id == task_id:
+    async def has_cycle_to_target(current_id: int, target_id: int) -> bool:
+        """DFS 检查从 current_id 是否能到达 target_id"""
+        if current_id == target_id:
             return True
+        if current_id in visited:
+            return False
 
-        # 如果已经在访问过的集合中，说明有循环
-        if dep_id in visited:
-            return True
+        visited.add(current_id)
+        path.add(current_id)
 
-        visited.add(dep_id)
-
-        # 查询该任务的依赖
         try:
             row = await conn.fetchrow(
                 "SELECT dependencies FROM tasks WHERE id = $1 AND deleted_at IS NULL",
-                dep_id
+                current_id
             )
             if row and row['dependencies']:
-                queue.extend(row['dependencies'])
+                for next_id in row['dependencies']:
+                    if next_id in path:  # 检测到循环
+                        # 继续检查是否能到达 target
+                        if await has_cycle_to_target(next_id, target_id):
+                            return True
+                    else:
+                        if await has_cycle_to_target(next_id, target_id):
+                            return True
         except Exception:
-            # 如果查询失败（如任务不存在），继续检查其他依赖
             pass
 
+        path.remove(current_id)
+        return False
+
+    # 检查每个新依赖是否能到达当前任务
+    for dep_id in new_deps:
+        # 直接依赖检查
+        if task_id is not None and dep_id == task_id:
+            return True
+        # 间接依赖检查
+        if task_id is not None:
+            visited.clear()  # 每个依赖单独检查，清空 visited
+            if await has_cycle_to_target(dep_id, task_id):
+                return True
+
     return False
+
+
+async def detect_all_cycles_in_project(conn: asyncpg.Connection, project_id: int) -> list[list[int]]:
+    """检测项目中所有循环依赖
+
+    使用 Tarjan 算法检测有向图中的所有强连通分量(SCC)，
+    大小大于1的SCC即为循环。
+
+    Args:
+        conn: 数据库连接
+        project_id: 项目ID
+
+    Returns:
+        list[list[int]]: 所有循环的列表，每个循环是任务ID列表
+    """
+    # 获取项目中所有任务及其依赖
+    rows = await conn.fetch(
+        "SELECT id, dependencies FROM tasks WHERE project_id = $1 AND deleted_at IS NULL",
+        project_id
+    )
+
+    # 构建图
+    graph = {}
+    task_ids = set()
+    for row in rows:
+        task_id = row['id']
+        task_ids.add(task_id)
+        deps = row['dependencies'] or []
+        # 只保留项目中存在的任务依赖
+        graph[task_id] = [d for d in deps if d in task_ids]
+
+    # Tarjan 算法找强连通分量
+    index_counter = [0]
+    stack = []
+    lowlinks = {}
+    index = {}
+    on_stack = {}
+    cycles = []
+
+    def strongconnect(v):
+        index[v] = index_counter[0]
+        lowlinks[v] = index_counter[0]
+        index_counter[0] += 1
+        stack.append(v)
+        on_stack[v] = True
+
+        for w in graph.get(v, []):
+            if w not in index:
+                strongconnect(w)
+                lowlinks[v] = min(lowlinks[v], lowlinks[w])
+            elif on_stack.get(w, False):
+                lowlinks[v] = min(lowlinks[v], index[w])
+
+        if lowlinks[v] == index[v]:
+            # 找到一个强连通分量
+            scc = []
+            while True:
+                w = stack.pop()
+                on_stack[w] = False
+                scc.append(w)
+                if w == v:
+                    break
+            if len(scc) > 1:
+                cycles.append(scc)
+
+    for v in graph:
+        if v not in index:
+            strongconnect(v)
+
+    return cycles
+
+
+async def validate_no_existing_cycles(conn: asyncpg.Connection, project_id: int) -> None:
+    """验证项目中不存在循环依赖
+
+    在创建任务前调用，确保项目依赖图是有效的。
+
+    Args:
+        conn: 数据库连接
+        project_id: 项目ID
+
+    Raises:
+        HTTPException: 如果检测到循环依赖
+    """
+    from fastapi import HTTPException
+
+    cycles = await detect_all_cycles_in_project(conn, project_id)
+    if cycles:
+        cycle_str = " -> ".join(map(str, cycles[0])) + f" -> {cycles[0][0]}"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Circular dependency detected in project: {cycle_str}"
+        )
 
 
 # ============ Agent Utilities ============
