@@ -2,17 +2,40 @@
 
 ## 运行测试
 
-### 安装依赖
+### 使用 uv（推荐）
+
+```bash
+cd task-service
+
+# 运行所有测试
+uv run pytest tests/ -v
+
+# 特定测试
+uv run pytest tests/ -k test_name
+
+# 覆盖率
+uv run pytest tests/ --cov=. --cov-report=html
+```
+
+### 使用 pip
 
 ```bash
 cd task-service
 pip install pytest pytest-asyncio httpx pytest-cov
+pytest tests/ -v
 ```
 
-### 运行所有测试
+### 使用开发脚本
 
 ```bash
-pytest tests/ -v
+# 运行所有测试
+./scripts/dev.sh test
+
+# 详细输出
+./scripts/dev.sh test -v
+
+# 覆盖率报告
+./scripts/dev.sh test --cov
 ```
 
 ### 运行特定测试

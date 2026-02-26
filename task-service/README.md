@@ -203,6 +203,23 @@ pytest tests/ -k test_name
 pytest tests/ --cov=. --cov-report=html
 ```
 
+### 代码质量
+
+项目使用 [ruff](https://github.com/astral-sh/ruff) 进行代码检查和格式化：
+
+```bash
+# 代码检查
+./scripts/dev.sh lint
+
+# 自动修复问题
+./scripts/dev.sh lint --fix
+
+# 代码格式化
+./scripts/dev.sh format
+```
+
+脚本优先使用 `uv` 运行（如果已安装），否则回退到直接调用。
+
 ## 核心功能
 
 ### 任务生命周期
@@ -266,6 +283,13 @@ curl -X POST http://localhost:8080/v1/tasks \
 - **heartbeat_monitor**: 检测离线 Agent
 - **stuck_task_monitor**: 释放超时任务
 - **soft_delete_cleanup_monitor**: 清理过期软删除记录
+
+### 近期优化
+
+- **速率限制器**: 添加内存上限和强制清理机制，防止内存泄漏
+- **循环依赖检测**: 优化算法，避免误判共享依赖为循环
+- **优雅关闭**: 支持后台任务可中断关闭
+- **数据库连接池**: 添加错误计数器，避免频繁重置
 
 ## 常见问题
 

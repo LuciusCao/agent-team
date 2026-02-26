@@ -21,7 +21,18 @@
 
 ## 快速开始
 
-### 开发环境快速启动（推荐）
+### 1. 安装依赖
+
+- Docker Desktop
+
+将项目路径加入到.zshrc
+```bash
+export PATH="$PATH:$HOME/GitHub/agent-team"
+source ~/.zshrc
+```
+---
+
+### 2. 开发环境快速启动
 
 使用开发工具脚本快速管理环境：
 
@@ -33,51 +44,11 @@ cd task-service
 
 # 生成测试数据
 ./scripts/dev.sh seed --projects 3 --tasks 5
-
-# 查看服务状态
-./scripts/dev.sh status
-
-# 查看日志
-./scripts/dev.sh logs -f
-
-# 运行测试
-./scripts/dev.sh test
-
-# 停止服务
-./scripts/dev.sh stop
 ```
 
 更多脚本功能详见 [task-service/scripts/README.md](task-service/scripts/README.md)
 
 ---
-
-### 手动启动（传统方式）
-
-如果你不想使用脚本，也可以手动启动：
-
-#### 1. 安装依赖
-
-- Docker Desktop
-
-将项目路径加入到.zshrc
-```bash
-export PATH="$PATH:$HOME/GitHub/agent-team"
-source ~/.zshrc
-```
-
-#### 2. 启动任务服务
-
-```bash
-cd task-service
-./scripts/dev.sh start --fresh
-```
-
-或者手动启动：
-
-```bash
-cd task-service
-docker compose up -d
-```
 
 ### 3. 创建 Agent
 
@@ -89,19 +60,42 @@ agent create my-agent
 
 编辑 `agents/<agent-name>/.env`：
 
+在每个 agent 的 `.env` 中配置：
 ```env
+
+| 变量 | 说明 | 默认值 |
+|------|------|---------|
+| `PROJECT_ROOT` | 项目根目录 | ~/GitHub/agent-team |
+| `PORT` | 端口 | 43001 |
+| `DISCORD_BOT_TOKEN` | Discord Bot | - |
+| `API_KEY` | LLM API Key | - |
+| `PROVIDER` | LLM Provider | kimi-code |
+| `MODEL` | 模型 | kimi-k2.5 |
+| `AGENT_NAME` | Agent 名称 | agent |
+| `TASK_SERVICE_URL` | 任务服务地址 | http://host.docker.internal:8080 |
+```
+#### 配置说明
+##### config.example.toml
+
+```toml
+[discord]
+mention_only = true          # 大厅需要 @ 才回复
+compact_context = true       # 压缩上下文
+
+[browser]
+enabled = true               # 启用浏览器
+
+[heartbeat]
+enabled = true               # 启用心跳
+
+[skills]
+paths = ["./skills"]         # Skill 目录
 DISCORD_BOT_TOKEN=你的BotToken
 API_KEY=你的APIKey
 AGENT_NAME=my-agent
-
-# Task Service 地址
-# 本机开发: http://host.docker.internal:8080
-# 局域网其他设备: http://<本机IP>:8080
-# 云服务器: http://<服务器IP或域名>:8080
-TASK_SERVICE_URL=http://host.docker.internal:8080
 ```
 
-#### 跨网络访问配置
+##### 跨网络访问配置
 
 **场景1: Agent 运行在同一台机器**
 ```env
@@ -166,7 +160,9 @@ agent-team/
 │   │   └── channels.py      # 频道 API
 │   ├── schema.sql           # 数据库 Schema
 │   ├── docker-compose.yml
-│   └── DEPLOYMENT.md        # 部署指南
+│   ├── DEPLOYMENT.md        # 部署指南
+│   ├── CHANGELOG.md         # 版本变更记录
+│   └── tests/               # 测试套件
 ├── skills/                  # Agent Skills
 │   ├── agent-manager/       # Agent 管理（注册/移除/查询）
 │   ├── project-manager/     # 项目管理（创建/拆分/监控）
@@ -250,12 +246,6 @@ Task Service 提供完整的 REST API 用于任务管理。详细 API 文档请�
 API 文档（Swagger UI）：http://localhost:8080/docs
 
 ## Skills
-curl -X POST "http://localhost:8080/tasks/1/review?reviewer=coordinator" \
-  -H "Content-Type: application/json" \
-  -d '{"approved": true, "feedback": "质量很好"}'
-```
-
-## Skills
 
 ### task-manager
 管理任务的 Skill，Agent 可以用它：
@@ -277,48 +267,7 @@ Agent 生命周期管理：
 - 从频道移除
 - 查询频道活跃 Agent
 
-## 使用方法
-
-| 命令 | 说明 |
-|------|------|
-| `agent create <name>` | 创建新 Agent |
-| `agent config <name>` | 生成配置 |
-| `agent start [name]` | 启动 (无参数启动所有) |
-| `agent stop [name]` | 停止 (无参数停止所有) |
-
-## 环境变量
-
-在每个 agent 的 `.env` 中配置：
-
-| 变量 | 说明 | 默认值 |
-|------|------|---------|
-| `PROJECT_ROOT` | 项目根目录 | ~/GitHub/agent-team |
-| `PORT` | 端口 | 43001 |
-| `DISCORD_BOT_TOKEN` | Discord Bot | - |
-| `API_KEY` | LLM API Key | - |
-| `PROVIDER` | LLM Provider | kimi-code |
-| `MODEL` | 模型 | kimi-k2.5 |
-| `AGENT_NAME` | Agent 名称 | agent |
-| `TASK_SERVICE_URL` | 任务服务地址 | http://host.docker.internal:8080 |
-
-## 配置说明
-
-### config.example.toml
-
-```toml
-[discord]
-mention_only = true          # 大厅需要 @ 才回复
-compact_context = true       # 压缩上下文
-
-[browser]
-enabled = true               # 启用浏览器
-
-[heartbeat]
-enabled = true               # 启用心跳
-
-[skills]
-paths = ["./skills"]         # Skill 目录
-```
+---
 
 ## Agent 最佳实践
 
@@ -332,217 +281,7 @@ paths = ["./skills"]         # Skill 目录
 
 ### 使用任务系统
 
-Worker Agent 使用任务系统的完整流程：
-
-#### 1. 注册 Agent 并启动心跳
-
-Agent 启动时必须向 Task Service 注册并启动心跳：
-
-```python
-from skills.agent_manager import register_to_channel, start_heartbeat_loop, update_current_task
-
-# 1. 注册到 Task Service
-register_to_channel(channel_id="123456", channel_name="#ai项目")
-
-# 2. 启动心跳循环（每 30 秒发送一次）
-start_heartbeat_loop(interval_seconds=30)
-```
-
-**注意**：心跳是必须的！如果 5 分钟没有心跳，Agent 会被标记为 offline。
-
-#### 2. 多任务模式工作流程
-
-Agent 可以认领多个任务，但同一时间只能执行一个：
-
-```python
-def multi_task_workflow():
-    """多任务模式工作流示例"""
-    
-    # 1. 认领多个任务（最多 MAX_CONCURRENT_TASKS 个）
-    task_a = claim_task(task_id=1)  # assigned
-    task_b = claim_task(task_id=2)  # assigned
-    task_c = claim_task(task_id=3)  # assigned
-    
-    # 2. 开始执行第一个任务
-    start_task(task_id=1)           # A: running, B/C: assigned
-    update_current_task(task_id=1)  # 更新心跳中的任务ID
-    execute_task(task_a)
-    submit_task(task_id=1)          # A: reviewing, B/C: assigned
-    update_current_task(task_id=None)
-    
-    # 3. 开始执行第二个任务
-    start_task(task_id=2)           # A: reviewing, B: running, C: assigned
-    update_current_task(task_id=2)
-    execute_task(task_b)
-    submit_task(task_id=2)          # A/B: reviewing, C: assigned
-    update_current_task(task_id=None)
-    
-    # 4. 继续执行第三个任务...
-```
-
-#### 3. 查找并认领任务
-
-Worker 主动拉取适合自己的任务：
-
-```python
-def find_and_claim_task():
-    """查找并认领任务"""
-    # 获取适合当前 Agent 的任务（技能匹配 + 依赖检查）
-    resp = requests.get(
-        f"{TASK_SERVICE_URL}/tasks/available-for/{AGENT_NAME}"
-    )
-    tasks = resp.json()
-    
-    if not tasks:
-        return None
-    
-    # 认领优先级最高的任务
-    task = tasks[0]  # API 已按优先级排序
-    task_id = task["id"]
-    
-    # 认领任务（乐观锁，可能失败）
-    resp = requests.post(
-        f"{TASK_SERVICE_URL}/tasks/{task_id}/claim",
-        params={"agent_name": AGENT_NAME}
-    )
-    
-    if resp.status_code == 200:
-        print(f"✅ 认领任务 #{task_id}: {task['title']}")
-        return resp.json()
-    elif resp.status_code == 429:
-        print(f"⏳ 已达最大并发任务数限制")
-        return None
-    else:
-        print(f"❌ 认领失败: {resp.text}")
-        return None
-```
-
-#### 4. 执行任务
-
-认领后开始执行并定期更新进度：
-
-```python
-def start_task(task_id):
-    """开始执行任务"""
-    resp = requests.post(
-        f"{TASK_SERVICE_URL}/tasks/{task_id}/start",
-        params={"agent_name": AGENT_NAME}
-    )
-    return resp.json()
-
-def execute_task(task):
-    """实际执行任务"""
-    task_id = task["id"]
-    
-    # 1. 开始任务
-    start_task(task_id)
-    
-    # 2. 执行任务内容...
-    result = do_actual_work(task)
-    
-    return result
-
-def do_actual_work(task):
-    """实际的工作逻辑（由 Agent 自己实现）"""
-    # 这里是 Agent 的核心能力
-    # 例如：调研、写作、编程等
-    pass
-```
-
-#### 5. 提交验收
-
-完成后提交给 Reviewer 验收：
-
-```python
-def submit_task(task_id, result):
-    """提交任务完成"""
-    resp = requests.post(
-        f"{TASK_SERVICE_URL}/tasks/{task_id}/submit",
-        params={"agent_name": AGENT_NAME},
-        json={"result": result}  # 任务结果
-    )
-    
-    if resp.status_code == 200:
-        print(f"✅ 任务 #{task_id} 已提交验收")
-        return resp.json()
-    else:
-        print(f"❌ 提交失败: {resp.text}")
-        return None
-```
-
-#### 6. 完整的 Worker 主循环
-
-```python
-import time
-import threading
-
-def worker_main_loop():
-    """Worker Agent 主循环"""
-    # 1. 注册
-    register_agent()
-    
-    # 2. 启动心跳
-    threading.Thread(target=heartbeat_loop, daemon=True).start()
-    
-    current_task = None
-    
-    while True:
-        # 如果没有任务，尝试获取
-        if not current_task:
-            current_task = find_and_claim_task()
-            
-            if current_task:
-                try:
-                    # 执行任务
-                    result = execute_task(current_task)
-                    
-                    # 提交验收
-                    submit_task(current_task["id"], result)
-                    
-                    current_task = None
-                except Exception as e:
-                    print(f"❌ 任务执行失败: {e}")
-                    # 释放任务回队列
-                    requests.post(
-                        f"{TASK_SERVICE_URL}/tasks/{current_task['id']}/release",
-                        params={"agent_name": AGENT_NAME}
-                    )
-                    current_task = None
-            else:
-                print("⏳ 没有可用任务，等待 10 秒...")
-                time.sleep(10)
-        else:
-            # 正在执行任务，等待完成
-            time.sleep(5)
-
-# 启动 Worker
-if __name__ == "__main__":
-    worker_main_loop()
-```
-
-#### 7. 处理验收结果
-
-Agent 可以通过查询任务状态了解验收结果：
-
-```python
-def check_task_status(task_id):
-    """检查任务状态"""
-    resp = requests.get(f"{TASK_SERVICE_URL}/tasks/{task_id}")
-    task = resp.json()["task"]
-    
-    if task["status"] == "completed":
-        print(f"🎉 任务 #{task_id} 已通过验收！")
-    elif task["status"] == "rejected":
-        print(f"❌ 任务 #{task_id} 被拒绝")
-        print(f"反馈: {task.get('feedback', '无反馈')}")
-        # 可能需要重新认领并修改
-    
-    return task["status"]
-```
-
-#### 使用 Skill 简化
-
-实际使用中，Agent 可以通过 `task-manager` skill 简化操作：
+Worker Agent 可以通过 `task-manager` skill 简化操作：
 
 ```python
 # 在 SOUL.md 中配置 Skill
@@ -617,19 +356,7 @@ POST /v1/tasks/1/restore
 - **agents** - Agent 注册信息（含技能、统计）
 - **task_logs** - 任务操作日志
 
-## 常见问题
-
-### Q: 私聊不回复？
-A: 设置 `mention_only = false`
-
-### Q: 需要 pairing？
-A: 首次启动需要配对，之后不需要
-
-### Q: 任务服务连接失败？
-A: 确保 `TASK_SERVICE_URL` 正确，Docker 环境使用 `http://host.docker.internal:8080`
-
-### Q: Agent 如何发现任务？
-A: Agent 使用 `task-manager` skill 轮询 `/tasks/available-for/{agent_name}`
+---
 
 ## Roadmap
 
@@ -643,6 +370,14 @@ A: Agent 使用 `task-manager` skill 轮询 `/tasks/available-for/{agent_name}`
 - [ ] 更多项目模板
 - [ ] Agent 绩效分析
 - [ ] 动态优先级调整
+
+## 相关文档
+
+- [Task Service 详细文档](task-service/README.md)
+- [开发工具脚本](task-service/scripts/README.md)
+- [测试文档](task-service/tests/README.md)
+- [部署指南](task-service/DEPLOYMENT.md)
+- [版本变更记录](task-service/CHANGELOG.md)
 
 ## License
 
