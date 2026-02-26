@@ -163,15 +163,16 @@ case "${1:-help}" in
         ;;
     lint)
         shift
-        echo -e "${BLUE}运行代码检查...${NC}"
+        echo -e "${BLUE}[INFO]${NC} 运行代码检查..."
         if command -v uv > /dev/null 2>&1; then
+            echo -e "${GREEN}[INFO]${NC} 使用 uv 运行 ruff ✓"
             if [ "$1" = "--fix" ]; then
                 uv run ruff check . --fix
             else
                 uv run ruff check .
             fi
         else
-            echo -e "${YELLOW}uv 未安装，尝试使用 ruff 直接运行${NC}"
+            echo -e "${YELLOW}[WARN]${NC} uv 未安装，尝试使用 ruff 直接运行"
             if [ "$1" = "--fix" ]; then
                 ruff check . --fix
             else
@@ -180,11 +181,12 @@ case "${1:-help}" in
         fi
         ;;
     format)
-        echo -e "${BLUE}运行代码格式化...${NC}"
+        echo -e "${BLUE}[INFO]${NC} 运行代码格式化..."
         if command -v uv > /dev/null 2>&1; then
+            echo -e "${GREEN}[INFO]${NC} 使用 uv 运行 ruff ✓"
             uv run ruff format .
         else
-            echo -e "${YELLOW}uv 未安装，尝试使用 ruff 直接运行${NC}"
+            echo -e "${YELLOW}[WARN]${NC} uv 未安装，尝试使用 ruff 直接运行"
             ruff format .
         fi
         ;;

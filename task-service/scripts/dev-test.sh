@@ -102,6 +102,7 @@ run_tests() {
     
     # 使用 uv 运行测试
     if command -v uv > /dev/null 2>&1; then
+        log_info "使用 uv 运行测试 ✓"
         uv run pytest tests/ $verbose $keyword $cov --tb=short
     else
         log_warn "uv 未安装，使用 python3 运行测试"
@@ -115,6 +116,7 @@ watch_tests() {
     log_info "按 Ctrl+C 退出"
     
     if command -v uv > /dev/null 2>&1; then
+        log_info "使用 uv 运行 pytest-watch ✓"
         uv run ptw tests/ -- -v --tb=short
     else
         log_warn "uv 未安装，使用 pip 安装 pytest-watch"
