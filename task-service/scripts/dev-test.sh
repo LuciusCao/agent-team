@@ -100,7 +100,14 @@ run_tests() {
         log_info "覆盖率报告将生成在 htmlcov/ 目录"
     fi
     
-    python3 -m pytest tests/ $verbose $keyword $cov --tb=short
+    # 使用 uv 运行测试
+    if command -v uv > /dev/null 2>&1; then
+        log_info "使用 uv 运行测试 ✓"
+        uv run pytest tests/ $verbose $keyword $cov --tb=short
+    else
+        log_warn "uv 未安装，使用 python3 运行测试"
+        python3 -m pytest tests/ $verbose $keyword $cov --tb=short
+    fi
 }
 
 # 监视模式
@@ -108,12 +115,17 @@ watch_tests() {
     log_info "监视模式 - 文件变化时自动运行测试"
     log_info "按 Ctrl+C 退出"
     
-    if ! command -v ptw > /dev/null 2>&1; then
-        log_info "安装 pytest-watch..."
-        pip install pytest-watch
+    if command -v uv > /dev/null 2>&1; then
+        log_info "使用 uv 运行 pytest-watch ✓"
+        uv run ptw tests/ -- -v --tb=short
+    else
+        log_warn "uv 未安装，使用 pip 安装 pytest-watch"
+        if ! command -v ptw > /dev/null 2>&1; then
+            log_info "安装 pytest-watch..."
+            pip install pytest-watch
+        fi
+        ptw tests/ -- -v --tb=short
     fi
-    
-    ptw tests/ -- -v --tb=short
 }
 
 # 主函数

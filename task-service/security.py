@@ -44,7 +44,7 @@ async def rate_limit(request: Request):
     """
     client_ip = request.client.host if request.client else "unknown"
 
-    if not _rate_limiter.is_allowed(client_ip):
+    if not await _rate_limiter.is_allowed(client_ip):
         raise HTTPException(
             status_code=429,
             detail=f"Rate limit exceeded. Max {Config.RATE_LIMIT_MAX_REQUESTS} requests per {Config.RATE_LIMIT_WINDOW} seconds"
