@@ -63,4 +63,22 @@ class Config:
         if cls.DEFAULT_TASK_TIMEOUT_MINUTES < 1:
             errors.append("DEFAULT_TASK_TIMEOUT_MINUTES must be at least 1")
 
+        # 新增：验证数据库连接超时
+        if cls.DB_COMMAND_TIMEOUT < 1:
+            errors.append("DB_COMMAND_TIMEOUT must be at least 1 second")
+        if cls.DB_COMMAND_TIMEOUT > 300:
+            errors.append("DB_COMMAND_TIMEOUT should not exceed 300 seconds (5 minutes)")
+
+        # 新增：验证最大查询数
+        if cls.DB_MAX_QUERIES < 1000:
+            errors.append("DB_MAX_QUERIES should be at least 1000")
+        if cls.DB_MAX_QUERIES > 1000000:
+            errors.append("DB_MAX_QUERIES should not exceed 1,000,000")
+
+        # 新增：验证速率限制配置
+        if cls.RATE_LIMIT_MAX_REQUESTS < 1:
+            errors.append("RATE_LIMIT_MAX_REQUESTS must be at least 1")
+        if cls.RATE_LIMIT_MAX_STORE_SIZE < 100:
+            errors.append("RATE_LIMIT_MAX_STORE_SIZE should be at least 100")
+
         return errors

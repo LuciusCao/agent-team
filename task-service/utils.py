@@ -371,6 +371,99 @@ async def check_circular_dependency(conn: asyncpg.Connection, task_id: int | Non
     return False
 
 
+async def detect_all_cycles_in_project(conn: asyncpg.Connection, project_id: int) -> list[list[int]]:
+    """检测项目中所有循环依赖
+
+    使用 Tarjan 算法检测有向图中的所有强连通分量(SCC)，
+    大小大于1的SCC即为循环。
+
+    Args:
+        conn: 数据库连接
+        project_id: 项目ID
+
+    Returns:
+        list[list[int]]: 所有循环的列表，每个循环是任务ID列表
+    """
+    # 获取项目中所有任务及其依赖
+    rows = await conn.fetch(
+        "SELECT id, dependencies FROM tasks WHERE project_id = $1 AND deleted_at IS NULL",
+        project_id
+    )
+
+    # 构建图
+    graph = {}
+    task_ids = set()
+    for row in rows:
+        task_id = row['id']
+        task_ids.add(task_id)
+        deps = row['dependencies'] or []
+        # 只保留项目中存在的任务依赖
+        graph[task_id] = [d for d in deps if d in task_ids]
+
+    # Tarjan 算法找强连通分量
+    index_counter = [0]
+    stack = []
+    lowlinks = {}
+    index = {}
+    on_stack = {}
+    cycles = []
+
+    def strongconnect(v):
+        index[v] = index_counter[0]
+        lowlinks[v] = index_counter[0]
+        index_counter[0] += 1
+        stack.append(v)
+        on_stack[v] = True
+
+        for w in graph.get(v, []):
+            if w not in index:
+                strongconnect(w)
+                lowlinks[v] = min(lowlinks[v], lowlinks[w])
+            elif on_stack.get(w, False):
+                lowlinks[v] = min(lowlinks[v], index[w])
+
+        if lowlinks[v] == index[v]:
+            # 找到一个强连通分量
+            scc = []
+            while True:
+                w = stack.pop()
+                on_stack[w] = False
+                scc.append(w)
+                if w == v:
+                    break
+            if len(scc) > 1:
+                cycles.append(scc)
+
+    for v in graph:
+        if v not in index:
+            strongconnect(v)
+
+    return cycles
+
+
+async def validate_no_existing_cycles(conn: asyncpg.Connection, project_id: int) -> None:
+    """验证项目中不存在循环依赖
+
+    在创建任务前调用，确保项目依赖图是有效的。
+
+    Args:
+        conn: 数据库连接
+        project_id: 项目ID
+
+    Raises:
+        HTTPException: 如果检测到循环依赖
+    """
+    from fastapi import HTTPException
+
+    cycles = await detect_all_cycles_in_project(conn, project_id)
+    if cycles:
+        cycle_str = " -> ".join(map(str, cycles[0])) + f" -> {cycles[0][0]}"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Circular dependency detected in project: {cycle_str}"
+        )
+
+
 # ============ Agent Utilities ============
 
 async def update_agent_status_after_task_change(conn: asyncpg.Connection, agent_name: str):
