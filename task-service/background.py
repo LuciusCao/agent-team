@@ -16,13 +16,9 @@ logger = logging.getLogger("task_service")
 # 错误计数器，用于控制 reset_pool 频率
 _error_counts = {
     "heartbeat": 0,
-    "stuck_task": 0,
-    "soft_delete_cleanup": 0
+    "stuck_task": 0
 }
 _MAX_ERRORS_BEFORE_RESET = 3
-
-# 全局关闭事件
-_shutdown_event = asyncio.Event()
 
 
 def _should_reset_pool(monitor_name: str) -> bool:
@@ -42,33 +38,10 @@ def _reset_error_count(monitor_name: str):
     _error_counts[monitor_name] = 0
 
 
-async def _sleep_with_shutdown_check(interval_seconds: float) -> bool:
-    """睡眠指定时间，但检查关闭信号
-
-    Args:
-        interval_seconds: 睡眠间隔（秒）
-
-    Returns:
-        bool: 如果收到关闭信号返回 True
-    """
-    try:
-        await asyncio.wait_for(
-            _shutdown_event.wait(),
-            timeout=interval_seconds
-        )
-        return True  # 收到关闭信号
-    except asyncio.TimeoutError:
-        return False  # 正常超时
-
-
 async def heartbeat_monitor():
     """监控 Agent 心跳，超时设为 offline"""
-    while not _shutdown_event.is_set():
-        # 使用可中断的睡眠
-        should_stop = await _sleep_with_shutdown_check(Config.HEARTBEAT_INTERVAL_SECONDS)
-        if should_stop:
-            break
-
+    while True:
+        await asyncio.sleep(Config.HEARTBEAT_INTERVAL_SECONDS)
         try:
             pool = await get_pool()
 
@@ -95,17 +68,11 @@ async def heartbeat_monitor():
             # 其他错误，记录但不重置连接池
             logger.error(f"Heartbeat monitor unexpected error: {e}", exc_info=True)
 
-    logger.info("Heartbeat monitor stopped gracefully")
-
 
 async def stuck_task_monitor():
     """监控卡住的任务，自动释放"""
-    while not _shutdown_event.is_set():
-        # 使用可中断的睡眠
-        should_stop = await _sleep_with_shutdown_check(Config.STUCK_TASK_CHECK_INTERVAL_SECONDS)
-        if should_stop:
-            break
-
+    while True:
+        await asyncio.sleep(Config.STUCK_TASK_CHECK_INTERVAL_SECONDS)
         try:
             pool = await get_pool()
 
@@ -182,20 +149,14 @@ async def stuck_task_monitor():
             # 其他错误，记录但不重置连接池
             logger.error(f"Stuck task monitor unexpected error: {e}", exc_info=True)
 
-    logger.info("Stuck task monitor stopped gracefully")
-
 
 async def soft_delete_cleanup_monitor():
     """定期清理超过保留期的软删除记录"""
     CLEANUP_INTERVAL_SECONDS = 86400  # 每天运行一次
     RETENTION_DAYS = 30  # 保留30天
 
-    while not _shutdown_event.is_set():
-        # 使用可中断的睡眠
-        should_stop = await _sleep_with_shutdown_check(CLEANUP_INTERVAL_SECONDS)
-        if should_stop:
-            break
-
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
         try:
             from utils import cleanup_soft_deleted
 
@@ -221,17 +182,3 @@ async def soft_delete_cleanup_monitor():
                 await reset_pool()
         except Exception as e:
             logger.error(f"Soft delete cleanup unexpected error: {e}", exc_info=True)
-
-    logger.info("Soft delete cleanup monitor stopped gracefully")
-
-
-async def shutdown_background_tasks():
-    """优雅关闭所有后台任务
-
-    发送关闭信号并等待任务结束。
-    """
-    logger.info("Shutting down background tasks...")
-    _shutdown_event.set()
-    # 给任务一些时间来检测信号并退出
-    await asyncio.sleep(0.5)
-    logger.info("Background tasks shutdown complete")
