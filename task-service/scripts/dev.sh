@@ -69,6 +69,11 @@ show_help() {
                      --cov       覆盖率报告
                      --watch     监视模式
 
+    lint             运行代码检查 (ruff)
+                     --fix       自动修复问题
+
+    format           运行代码格式化 (ruff format)
+
     seed [选项]      生成测试数据
                      --clean     先清空数据
                      --projects N
@@ -86,6 +91,9 @@ show_help() {
     ./scripts/dev.sh logs -f            # 跟踪日志
     ./scripts/dev.sh test --cov         # 覆盖率测试
     ./scripts/dev.sh seed --clean       # 清空后生成数据
+    ./scripts/dev.sh lint               # 代码检查
+    ./scripts/dev.sh lint --fix         # 自动修复代码问题
+    ./scripts/dev.sh format             # 代码格式化
 
 EOF
 }
@@ -152,6 +160,33 @@ case "${1:-help}" in
         shift
         check_script "dev-seed.sh"
         "$SCRIPT_DIR/dev-seed.sh" "$@"
+        ;;
+    lint)
+        shift
+        echo -e "${BLUE}运行代码检查...${NC}"
+        if command -v uv > /dev/null 2>&1; then
+            if [ "$1" = "--fix" ]; then
+                uv run ruff check . --fix
+            else
+                uv run ruff check .
+            fi
+        else
+            echo -e "${YELLOW}uv 未安装，尝试使用 ruff 直接运行${NC}"
+            if [ "$1" = "--fix" ]; then
+                ruff check . --fix
+            else
+                ruff check .
+            fi
+        fi
+        ;;
+    format)
+        echo -e "${BLUE}运行代码格式化...${NC}"
+        if command -v uv > /dev/null 2>&1; then
+            uv run ruff format .
+        else
+            echo -e "${YELLOW}uv 未安装，尝试使用 ruff 直接运行${NC}"
+            ruff format .
+        fi
         ;;
     status)
         show_status
