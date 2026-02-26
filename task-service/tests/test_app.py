@@ -30,38 +30,53 @@ from main import app, get_db
 
 # ============ 数据库初始化 ============
 
+_test_db_initialized = False
+
 async def init_test_database():
     """初始化测试数据库（只运行一次）"""
+    global _test_db_initialized
+    if _test_db_initialized:
+        return
+
     admin_url = "postgresql://taskmanager:taskmanager@localhost:5433/postgres"
     test_db_url = "postgresql://taskmanager:taskmanager@localhost:5433/taskmanager_test"
 
-    # 连接到 postgres 数据库创建测试数据库
-    conn = await asyncpg.connect(admin_url)
     try:
-        # 终止现有连接
-        await conn.execute("""
-            SELECT pg_terminate_backend(pg_stat_activity.pid)
-            FROM pg_stat_activity
-            WHERE pg_stat_activity.datname = 'taskmanager_test'
-            AND pid <> pg_backend_pid()
-        """)
-        await conn.execute("DROP DATABASE IF EXISTS taskmanager_test")
-        await conn.execute("CREATE DATABASE taskmanager_test")
-    finally:
-        await conn.close()
+        # 连接到 postgres 数据库创建测试数据库
+        conn = await asyncpg.connect(admin_url)
+        try:
+            # 终止现有连接
+            await conn.execute("""
+                SELECT pg_terminate_backend(pg_stat_activity.pid)
+                FROM pg_stat_activity
+                WHERE pg_stat_activity.datname = 'taskmanager_test'
+                AND pid <> pg_backend_pid()
+            """)
+            await conn.execute("DROP DATABASE IF EXISTS taskmanager_test")
+            await conn.execute("CREATE DATABASE taskmanager_test")
+        finally:
+            await conn.close()
 
-    # 连接到测试数据库并执行 schema
-    conn = await asyncpg.connect(test_db_url)
-    try:
-        with open("schema.sql") as f:
-            schema = f.read()
-            await conn.execute(schema)
-    finally:
-        await conn.close()
+        # 连接到测试数据库并执行 schema
+        conn = await asyncpg.connect(test_db_url)
+        try:
+            with open("schema.sql") as f:
+                schema = f.read()
+                await conn.execute(schema)
+        finally:
+            await conn.close()
+
+        _test_db_initialized = True
+    except Exception as e:
+        print(f"Warning: Failed to initialize test database: {e}")
+        # 不抛出异常，让测试在运行时处理连接问题
 
 
-# 在导入时初始化数据库
-asyncio.run(init_test_database())
+# 在导入时初始化数据库（带错误处理）
+try:
+    asyncio.run(init_test_database())
+except Exception as e:
+    print(f"Database initialization deferred: {e}")
 
 
 # ============ Fixtures ============
@@ -647,6 +662,77 @@ class TestCircularDependency:
             # 现在应该检测到循环: 新任务 -> D -> ... -> A -> D
             has_cycle = await check_circular_dependency(conn, 999, [task_d["id"]])
             assert has_cycle is True
+
+    async def test_check_circular_dependency_shared_dependency(self, test_db):
+        """测试共享依赖不应被误判为循环
+
+        场景: A -> C, B -> C (C 是 A 和 B 的共同依赖)
+        检查: B 依赖 A 不应该形成循环（虽然 C 被访问两次，但不是循环）
+        """
+        from utils import check_circular_dependency
+
+        async with test_db.acquire() as conn:
+            # 先创建项目
+            await conn.execute(
+                """INSERT INTO projects (id, name, status)
+                   VALUES (1, 'Test Project', 'active')
+                   ON CONFLICT DO NOTHING"""
+            )
+
+            # 创建任务 C（基础任务）
+            task_c = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status)
+                   VALUES (1, 'Task C', 'research', 'pending')
+                   RETURNING id"""
+            )
+
+            # 创建任务 A，依赖 C
+            task_a = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task A', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_c["id"]
+            )
+
+            # 创建任务 B，依赖 C
+            task_b = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
+                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
+                   RETURNING id""",
+                task_c["id"]
+            )
+
+            # B 依赖 A 不应该形成循环
+            # 路径: B -> A -> C (C 没有依赖，结束)
+            has_cycle = await check_circular_dependency(conn, task_b["id"], [task_a["id"]])
+            assert has_cycle is False, "Shared dependency should not be detected as cycle"
+
+            # 新任务同时依赖 A 和 B 也不应该形成循环
+            has_cycle = await check_circular_dependency(conn, 999, [task_a["id"], task_b["id"]])
+            assert has_cycle is False, "Diamond dependency pattern should not be detected as cycle"
+
+    async def test_check_circular_dependency_self_reference(self, test_db):
+        """测试任务不能依赖自己"""
+        from utils import check_circular_dependency
+
+        async with test_db.acquire() as conn:
+            # 先创建项目
+            await conn.execute(
+                """INSERT INTO projects (id, name, status)
+                   VALUES (1, 'Test Project', 'active')
+                   ON CONFLICT DO NOTHING"""
+            )
+
+            # 创建任务 A
+            task_a = await conn.fetchrow(
+                """INSERT INTO tasks (project_id, title, task_type, status)
+                   VALUES (1, 'Task A', 'research', 'pending')
+                   RETURNING id"""
+            )
+
+            # 任务 A 依赖自己应该形成循环
+            has_cycle = await check_circular_dependency(conn, task_a["id"], [task_a["id"]])
+            assert has_cycle is True, "Self-reference should be detected as cycle"
 
 
 if __name__ == "__main__":
