@@ -306,7 +306,9 @@ def validate_task_dependencies_for_create(dependencies: list[int]) -> None:
 async def check_circular_dependency(conn: asyncpg.Connection, task_id: int | None, new_deps: list[int]) -> bool:
     """检查添加新依赖是否会形成循环
 
-    使用 BFS 遍历依赖图，检测是否会回到当前任务或形成任何循环。
+    使用 BFS 遍历依赖图，检测是否会回到当前任务形成循环。
+    注意：此函数只检测是否会回到 task_id，不检测依赖图中其他循环
+    （其他循环应该在任务创建时就被阻止）。
 
     Args:
         conn: 数据库连接
@@ -319,33 +321,52 @@ async def check_circular_dependency(conn: asyncpg.Connection, task_id: int | Non
     if not new_deps:
         return False
 
+    # 使用 DFS 检测是否会回到当前任务
+    # visited 用于避免重复访问同一分支，不用于检测循环
     visited = set()
-    queue = list(new_deps)
+    # 当前遍历路径上的节点，用于检测循环
+    path = set()
 
-    while queue:
-        dep_id = queue.pop(0)
-
-        # 如果依赖指向当前任务，形成循环
-        if task_id is not None and dep_id == task_id:
+    async def has_cycle_to_target(current_id: int, target_id: int) -> bool:
+        """DFS 检查从 current_id 是否能到达 target_id"""
+        if current_id == target_id:
             return True
+        if current_id in visited:
+            return False
 
-        # 如果已经在访问过的集合中，说明有循环
-        if dep_id in visited:
-            return True
+        visited.add(current_id)
+        path.add(current_id)
 
-        visited.add(dep_id)
-
-        # 查询该任务的依赖
         try:
             row = await conn.fetchrow(
                 "SELECT dependencies FROM tasks WHERE id = $1 AND deleted_at IS NULL",
-                dep_id
+                current_id
             )
             if row and row['dependencies']:
-                queue.extend(row['dependencies'])
+                for next_id in row['dependencies']:
+                    if next_id in path:  # 检测到循环
+                        # 继续检查是否能到达 target
+                        if await has_cycle_to_target(next_id, target_id):
+                            return True
+                    else:
+                        if await has_cycle_to_target(next_id, target_id):
+                            return True
         except Exception:
-            # 如果查询失败（如任务不存在），继续检查其他依赖
             pass
+
+        path.remove(current_id)
+        return False
+
+    # 检查每个新依赖是否能到达当前任务
+    for dep_id in new_deps:
+        # 直接依赖检查
+        if task_id is not None and dep_id == task_id:
+            return True
+        # 间接依赖检查
+        if task_id is not None:
+            visited.clear()  # 每个依赖单独检查，清空 visited
+            if await has_cycle_to_target(dep_id, task_id):
+                return True
 
     return False
 
