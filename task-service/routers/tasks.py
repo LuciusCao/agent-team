@@ -11,6 +11,7 @@ from database import get_db
 from models import TaskCreate, TaskReview, TaskUpdate
 from security import rate_limit, verify_api_key
 from utils import (
+    check_circular_dependency,
     check_dependencies,
     check_idempotency,
     log_task_action,
@@ -30,11 +31,17 @@ async def create_task(task: TaskCreate, db=Depends(get_db)):
 
     如果指定了 dependencies，会检查是否存在循环依赖。
     """
-    # 检查循环依赖
+    # 基础验证
     if task.dependencies:
         validate_task_dependencies_for_create(task.dependencies)
 
     async with db.acquire() as conn:
+        # 检查循环依赖
+        if task.dependencies:
+            has_cycle = await check_circular_dependency(conn, None, task.dependencies)
+            if has_cycle:
+                raise HTTPException(status_code=400, detail="Circular dependency detected")
+
         result = await conn.fetchrow(
             """
             INSERT INTO tasks (
