@@ -1649,6 +1649,49 @@ class TestBackgroundFull:
         # 清理
         _shutdown_event.clear()
 
+    async def test_heartbeat_monitor_with_stuck_tasks(self, test_db):
+        """测试心跳监控器处理卡住的任务"""
+        from background import heartbeat_monitor, _shutdown_event
+
+        async with test_db.acquire() as conn:
+            # 创建项目
+            project = await conn.fetchrow("INSERT INTO projects (name, status) VALUES ('Heartbeat Test', 'active') RETURNING id")
+            # 创建 Agent
+            await conn.execute("INSERT INTO agents (name, role, status, last_heartbeat) VALUES ('heartbeat-agent', 'research', 'online', NOW() - INTERVAL '10 minutes')")
+            # 创建任务
+            await conn.execute("INSERT INTO tasks (project_id, title, task_type, status, assignee_agent, started_at) VALUES ($1, 'Stuck Task', 'research', 'running', 'heartbeat-agent', NOW() - INTERVAL '3 hours')", project['id'])
+
+        _shutdown_event.set()
+        await heartbeat_monitor()
+        _shutdown_event.clear()
+
+    async def test_stuck_task_monitor_release_task(self, test_db):
+        """测试卡住任务监控器释放超时任务"""
+        from background import stuck_task_monitor, _shutdown_event
+
+        async with test_db.acquire() as conn:
+            # 创建项目
+            project = await conn.fetchrow("INSERT INTO projects (name, status) VALUES ('Stuck Monitor Test', 'active') RETURNING id")
+            # 创建 Agent
+            await conn.execute("INSERT INTO agents (name, role, status) VALUES ('stuck-agent', 'research', 'busy')")
+            # 创建超时任务（使用默认超时时间）
+            await conn.execute("""
+                INSERT INTO tasks (project_id, title, task_type, status, assignee_agent, started_at)
+                VALUES ($1, 'Timeout Task', 'research', 'running', 'stuck-agent', NOW() - INTERVAL '3 hours')
+            """, project['id'])
+
+        _shutdown_event.set()
+        await stuck_task_monitor()
+        _shutdown_event.clear()
+
+    async def test_stuck_task_monitor_unexpected_error(self, test_db):
+        """测试卡住任务监控器处理意外错误"""
+        from background import stuck_task_monitor, _shutdown_event
+
+        _shutdown_event.set()
+        await stuck_task_monitor()
+        _shutdown_event.clear()
+
 
 class TestSecurityFull:
     """安全模块完整测试"""
