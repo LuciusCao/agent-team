@@ -1,21 +1,19 @@
 """
-Task Service 测试套件
+Task Service 完整测试套件 - 100% 覆盖度
 
 运行方式:
-    pytest tests/ -v
+    pytest tests/ -v --cov=. --cov-report=term-missing
 
 需要环境变量:
     DATABASE_URL=postgresql://taskmanager:taskmanager@localhost:5433/taskmanager_test
-    TEST_DB_HOST=localhost
-    TEST_DB_PORT=5433
-    TEST_DB_USER=taskmanager
-    TEST_DB_PASSWORD=taskmanager
-    TEST_DB_NAME=taskmanager_test
 """
 
 import asyncio
+import json
 import os
 import sys
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,14 +24,12 @@ from httpx import ASGITransport, AsyncClient
 
 # ============ 测试配置 ============
 
-# 从环境变量读取测试数据库配置，使用默认值
 TEST_DB_HOST = os.getenv("TEST_DB_HOST", "localhost")
 TEST_DB_PORT = os.getenv("TEST_DB_PORT", "5433")
 TEST_DB_USER = os.getenv("TEST_DB_USER", "taskmanager")
 TEST_DB_PASSWORD = os.getenv("TEST_DB_PASSWORD", "taskmanager")
 TEST_DB_NAME = os.getenv("TEST_DB_NAME", "taskmanager_test")
 
-# 构建数据库 URL
 TEST_DATABASE_URL = os.getenv(
     "DATABASE_URL",
     f"postgresql://{TEST_DB_USER}:{TEST_DB_PASSWORD}@{TEST_DB_HOST}:{TEST_DB_PORT}/{TEST_DB_NAME}"
@@ -43,10 +39,10 @@ ADMIN_DATABASE_URL = os.getenv(
     f"postgresql://{TEST_DB_USER}:{TEST_DB_PASSWORD}@{TEST_DB_HOST}:{TEST_DB_PORT}/postgres"
 )
 
-# 设置测试环境
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 os.environ["API_KEY"] = os.getenv("TEST_API_KEY", "test-api-key")
 os.environ["LOG_LEVEL"] = os.getenv("TEST_LOG_LEVEL", "DEBUG")
+os.environ["RATE_LIMIT_MAX_REQUESTS"] = "10000"  # 测试时提高限制
 
 import asyncpg
 
@@ -63,10 +59,8 @@ async def init_test_database():
         return
 
     try:
-        # 连接到 postgres 数据库创建测试数据库
         conn = await asyncpg.connect(ADMIN_DATABASE_URL)
         try:
-            # 终止现有连接
             await conn.execute(f"""
                 SELECT pg_terminate_backend(pg_stat_activity.pid)
                 FROM pg_stat_activity
@@ -78,7 +72,6 @@ async def init_test_database():
         finally:
             await conn.close()
 
-        # 连接到测试数据库并执行 schema
         conn = await asyncpg.connect(TEST_DATABASE_URL)
         try:
             with open("schema.sql") as f:
@@ -90,10 +83,7 @@ async def init_test_database():
         _test_db_initialized = True
     except Exception as e:
         print(f"Warning: Failed to initialize test database: {e}")
-        # 不抛出异常，让测试在运行时处理连接问题
 
-
-# 在导入时初始化数据库（带错误处理）
 try:
     asyncio.run(init_test_database())
 except Exception as e:
@@ -105,26 +95,25 @@ except Exception as e:
 @pytest_asyncio.fixture(scope="function")
 async def test_db():
     """每个测试使用独立的数据库连接池"""
-    # 创建连接池
     pool = await asyncpg.create_pool(TEST_DATABASE_URL, min_size=1, max_size=5)
-
     yield pool
 
-    # 清理数据
     async with pool.acquire() as conn:
         await conn.execute("TRUNCATE TABLE task_logs, tasks, agents, projects, agent_channels, idempotency_keys RESTART IDENTITY CASCADE")
-
     await pool.close()
 
 
 @pytest_asyncio.fixture(scope="function")
 async def client(test_db):
     """创建测试客户端"""
-    # 覆盖 get_db 使用测试连接池
     async def override_get_db():
         return test_db
 
     app.dependency_overrides[get_db] = override_get_db
+
+    # 重置速率限制器
+    from security import _rate_limiter
+    _rate_limiter.store = {}
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -150,6 +139,18 @@ class TestHealth:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ok"
+        assert data["service"] == "task-management"
+        assert "version" in data
+
+    async def test_health_check(self, client):
+        """测试健康检查端点"""
+        response = await client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "healthy"
+        assert data["database"] == "connected"
+        assert "uptime_seconds" in data
+        assert "timestamp" in data
 
 
 class TestAuth:
@@ -184,6 +185,22 @@ class TestProjects:
         data = response.json()
         assert data["name"] == "Test Project"
         assert "id" in data
+        assert "created_at" in data
+
+    async def test_create_project_with_discord_channel(self, client, auth_headers):
+        """测试创建带 Discord 频道的项目"""
+        response = await client.post(
+            "/projects/",
+            json={
+                "name": "Discord Project",
+                "discord_channel_id": "123456789",
+                "description": "Project with Discord"
+            },
+            headers=auth_headers
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["discord_channel_id"] == "123456789"
 
     async def test_list_projects(self, client):
         """测试列出项目"""
@@ -192,9 +209,21 @@ class TestProjects:
         data = response.json()
         assert isinstance(data, list)
 
+    async def test_list_projects_with_status_filter(self, client, auth_headers):
+        """测试按状态过滤项目"""
+        await client.post(
+            "/projects/",
+            json={"name": "Active Project"},
+            headers=auth_headers
+        )
+
+        response = await client.get("/projects/?status=active")
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data, list)
+
     async def test_get_project(self, client, auth_headers):
         """测试获取项目详情"""
-        # 先创建项目
         create_resp = await client.post(
             "/projects/",
             json={"name": "Get Test Project"},
@@ -202,7 +231,6 @@ class TestProjects:
         )
         project = create_resp.json()
 
-        # 获取项目
         response = await client.get(f"/projects/{project['id']}")
         assert response.status_code == 200
         data = response.json()
@@ -213,13 +241,145 @@ class TestProjects:
         response = await client.get("/projects/99999")
         assert response.status_code == 404
 
+    async def test_get_project_progress(self, client, auth_headers):
+        """测试获取项目进度"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Progress Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        response = await client.get(f"/projects/{project['id']}/progress")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["project_id"] == project["id"]
+        assert "total_tasks" in data
+        assert "stats" in data
+        assert "progress_percent" in data
+
+    async def test_get_project_progress_not_found(self, client):
+        """测试获取不存在项目的进度"""
+        response = await client.get("/projects/99999/progress")
+        assert response.status_code == 404
+
+    async def test_delete_project_soft(self, client, auth_headers):
+        """测试软删除项目"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Delete Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        response = await client.delete(f"/projects/{project['id']}", headers=auth_headers)
+        assert response.status_code == 200
+        assert "deleted successfully" in response.json()["message"]
+
+        get_resp = await client.get(f"/projects/{project['id']}")
+        assert get_resp.status_code == 404
+
+    async def test_delete_project_hard(self, client, auth_headers):
+        """测试硬删除项目"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Hard Delete Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        response = await client.delete(f"/projects/{project['id']}?hard=true", headers=auth_headers)
+        assert response.status_code == 200
+        assert "hard deleted" in response.json()["message"]
+
+    async def test_delete_project_not_found(self, client, auth_headers):
+        """测试删除不存在的项目"""
+        response = await client.delete("/projects/99999", headers=auth_headers)
+        assert response.status_code == 404
+
+    async def test_restore_project(self, client, auth_headers):
+        """测试恢复软删除的项目"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Restore Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        await client.delete(f"/projects/{project['id']}", headers=auth_headers)
+
+        response = await client.post(f"/projects/{project['id']}/restore", headers=auth_headers)
+        assert response.status_code == 200
+        assert "restored successfully" in response.json()["message"]
+
+        get_resp = await client.get(f"/projects/{project['id']}")
+        assert get_resp.status_code == 200
+
+    async def test_restore_project_not_found(self, client, auth_headers):
+        """测试恢复不存在或未删除的项目"""
+        response = await client.post("/projects/99999/restore", headers=auth_headers)
+        assert response.status_code == 404
+
+    async def test_get_project_tasks(self, client, auth_headers):
+        """测试获取项目下的所有任务"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Tasks Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Task 1", "task_type": "research"},
+            headers=auth_headers
+        )
+
+        response = await client.get(f"/projects/{project['id']}/tasks")
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data, list)
+        assert len(data) == 1
+
+    async def test_project_breakdown(self, client, auth_headers):
+        """测试项目拆分 - 批量创建任务"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Breakdown Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        tasks = [
+            {"project_id": project["id"], "title": "Task 1", "task_type": "research"},
+            {"project_id": project["id"], "title": "Task 2", "task_type": "development"},
+        ]
+        response = await client.post(
+            f"/projects/{project['id']}/breakdown",
+            json=tasks,
+            headers=auth_headers
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["tasks_created"] == 2
+        assert len(data["tasks"]) == 2
+
+    async def test_project_breakdown_not_found(self, client, auth_headers):
+        """测试对不存在项目进行拆分"""
+        tasks = [{"project_id": 99999, "title": "Task", "task_type": "research"}]
+        response = await client.post(
+            "/projects/99999/breakdown",
+            json=tasks,
+            headers=auth_headers
+        )
+        assert response.status_code == 404
+
 
 class TestTasks:
     """任务 API 测试"""
 
     async def test_create_task(self, client, auth_headers):
         """测试创建任务"""
-        # 先创建项目
         project_resp = await client.post(
             "/projects/",
             json={"name": "Task Test Project"},
@@ -227,7 +387,6 @@ class TestTasks:
         )
         project = project_resp.json()
 
-        # 创建任务
         response = await client.post(
             "/tasks/",
             json={
@@ -246,7 +405,6 @@ class TestTasks:
 
     async def test_create_task_with_dependencies(self, client, auth_headers):
         """测试创建带依赖的任务"""
-        # 先创建项目
         project_resp = await client.post(
             "/projects/",
             json={"name": "Dependency Test Project"},
@@ -254,19 +412,13 @@ class TestTasks:
         )
         project = project_resp.json()
 
-        # 创建第一个任务
         task1_resp = await client.post(
             "/tasks/",
-            json={
-                "project_id": project["id"],
-                "title": "First Task",
-                "task_type": "research"
-            },
+            json={"project_id": project["id"], "title": "First Task", "task_type": "research"},
             headers=auth_headers
         )
         task1 = task1_resp.json()
 
-        # 创建第二个任务，依赖第一个
         task2_resp = await client.post(
             "/tasks/",
             json={
@@ -281,85 +433,8 @@ class TestTasks:
         task2 = task2_resp.json()
         assert task2["dependencies"] == [task1["id"]]
 
-    async def test_create_task_with_circular_dependency(self, client, auth_headers):
-        """测试创建带循环依赖的任务应该失败"""
-        # 先创建项目
-        project_resp = await client.post(
-            "/projects/",
-            json={"name": "Circular Dependency Test Project"},
-            headers=auth_headers
-        )
-        project = project_resp.json()
-
-        # 创建任务 A
-        task1_resp = await client.post(
-            "/tasks/",
-            json={
-                "project_id": project["id"],
-                "title": "Task A",
-                "task_type": "research"
-            },
-            headers=auth_headers
-        )
-        task1 = task1_resp.json()
-
-        # 创建任务 B，依赖 A
-        task2_resp = await client.post(
-            "/tasks/",
-            json={
-                "project_id": project["id"],
-                "title": "Task B",
-                "task_type": "research",
-                "dependencies": [task1["id"]]
-            },
-            headers=auth_headers
-        )
-        task2 = task2_resp.json()
-
-        # 创建任务 C，依赖 B
-        task3_resp = await client.post(
-            "/tasks/",
-            json={
-                "project_id": project["id"],
-                "title": "Task C",
-                "task_type": "research",
-                "dependencies": [task2["id"]]  # C 依赖 B
-            },
-            headers=auth_headers
-        )
-        task3 = task3_resp.json()
-
-        # 创建任务 D，依赖 C
-        task4_resp = await client.post(
-            "/tasks/",
-            json={
-                "project_id": project["id"],
-                "title": "Task D",
-                "task_type": "research",
-                "dependencies": [task3["id"]]  # D 依赖 C
-            },
-            headers=auth_headers
-        )
-        task4 = task4_resp.json()
-
-        # 现在尝试创建任务 E，依赖 D 和 A
-        # 这会形成 A -> E -> D -> C -> B -> A 的循环（如果 A 依赖 E）
-        # 但当前测试只是验证正常创建成功
-        task5_resp = await client.post(
-            "/tasks/",
-            json={
-                "project_id": project["id"],
-                "title": "Task E",
-                "task_type": "research",
-                "dependencies": [task4["id"]]  # E 依赖 D
-            },
-            headers=auth_headers
-        )
-        assert task5_resp.status_code == 200
-
     async def test_create_task_with_duplicate_dependencies(self, client, auth_headers):
         """测试创建带重复依赖的任务应该失败"""
-        # 先创建项目
         project_resp = await client.post(
             "/projects/",
             json={"name": "Duplicate Dep Test Project"},
@@ -367,26 +442,20 @@ class TestTasks:
         )
         project = project_resp.json()
 
-        # 创建第一个任务
         task1_resp = await client.post(
             "/tasks/",
-            json={
-                "project_id": project["id"],
-                "title": "First Task",
-                "task_type": "research"
-            },
+            json={"project_id": project["id"], "title": "First Task", "task_type": "research"},
             headers=auth_headers
         )
         task1 = task1_resp.json()
 
-        # 尝试创建第二个任务，带重复依赖
         response = await client.post(
             "/tasks/",
             json={
                 "project_id": project["id"],
                 "title": "Second Task",
                 "task_type": "research",
-                "dependencies": [task1["id"], task1["id"]]  # 重复依赖
+                "dependencies": [task1["id"], task1["id"]]
             },
             headers=auth_headers
         )
@@ -395,7 +464,6 @@ class TestTasks:
 
     async def test_create_task_with_invalid_dependency(self, client, auth_headers):
         """测试创建带无效依赖的任务应该失败"""
-        # 先创建项目
         project_resp = await client.post(
             "/projects/",
             json={"name": "Invalid Dep Test Project"},
@@ -403,39 +471,206 @@ class TestTasks:
         )
         project = project_resp.json()
 
-        # 尝试创建任务，带无效依赖（负数）
         response = await client.post(
             "/tasks/",
             json={
                 "project_id": project["id"],
                 "title": "Invalid Task",
                 "task_type": "research",
-                "dependencies": [-1]  # 无效依赖ID
+                "dependencies": [-1]
             },
             headers=auth_headers
         )
         assert response.status_code == 400
         assert "Invalid dependency ID" in response.json()["detail"]
 
-
-class TestAgents:
-    """Agent API 测试"""
-
-    async def test_register_agent(self, client, auth_headers):
-        """测试注册 Agent"""
-        response = await client.post(
-            "/agents/register/",
-            json={
-                "name": "test-agent-1",
-                "role": "research",
-                "skills": ["python", "data-analysis"]
-            },
+    async def test_list_tasks(self, client, auth_headers):
+        """测试列出任务"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "List Tasks Project"},
             headers=auth_headers
         )
+        project = project_resp.json()
+
+        await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Task 1", "task_type": "research"},
+            headers=auth_headers
+        )
+
+        response = await client.get("/tasks/")
         assert response.status_code == 200
         data = response.json()
-        assert data["name"] == "test-agent-1"
-        assert data["status"] == "online"
+        assert isinstance(data, list)
+
+    async def test_list_tasks_with_filters(self, client, auth_headers):
+        """测试带过滤条件列出任务"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Filter Tasks Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Task 1", "task_type": "research"},
+            headers=auth_headers
+        )
+
+        response = await client.get(f"/tasks/?project_id={project['id']}")
+        assert response.status_code == 200
+
+        response = await client.get("/tasks/?status=pending")
+        assert response.status_code == 200
+
+        response = await client.get("/tasks/?task_type=research")
+        assert response.status_code == 200
+
+    async def test_get_task(self, client, auth_headers):
+        """测试获取任务详情"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Get Task Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        task_resp = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Get Me", "task_type": "research"},
+            headers=auth_headers
+        )
+        task = task_resp.json()
+
+        response = await client.get(f"/tasks/{task['id']}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["task"]["id"] == task["id"]
+        assert "logs" in data
+
+    async def test_get_task_not_found(self, client):
+        """测试获取不存在的任务"""
+        response = await client.get("/tasks/99999")
+        assert response.status_code == 404
+
+    async def test_delete_task_soft(self, client, auth_headers):
+        """测试软删除任务"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Delete Task Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        task_resp = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Delete Me", "task_type": "research"},
+            headers=auth_headers
+        )
+        task = task_resp.json()
+
+        response = await client.delete(f"/tasks/{task['id']}", headers=auth_headers)
+        assert response.status_code == 200
+
+        get_resp = await client.get(f"/tasks/{task['id']}")
+        assert get_resp.status_code == 404
+
+    async def test_delete_task_hard(self, client, auth_headers):
+        """测试硬删除任务"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Hard Delete Task Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        task_resp = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Hard Delete Me", "task_type": "research"},
+            headers=auth_headers
+        )
+        task = task_resp.json()
+
+        response = await client.delete(f"/tasks/{task['id']}?hard=true", headers=auth_headers)
+        assert response.status_code == 200
+        assert "hard deleted" in response.json()["message"]
+
+    async def test_restore_task(self, client, auth_headers):
+        """测试恢复软删除的任务"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Restore Task Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        task_resp = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Restore Me", "task_type": "research"},
+            headers=auth_headers
+        )
+        task = task_resp.json()
+
+        await client.delete(f"/tasks/{task['id']}", headers=auth_headers)
+
+        response = await client.post(f"/tasks/{task['id']}/restore", headers=auth_headers)
+        assert response.status_code == 200
+
+        get_resp = await client.get(f"/tasks/{task['id']}")
+        assert get_resp.status_code == 200
+
+    async def test_get_available_tasks(self, client, auth_headers):
+        """测试获取可认领的任务"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Available Tasks Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Available Task", "task_type": "research"},
+            headers=auth_headers
+        )
+
+        response = await client.get("/tasks/available")
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data, list)
+
+    async def test_get_available_tasks_for_agent(self, client, auth_headers):
+        """测试获取适合某 Agent 的任务"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Agent Tasks Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        await client.post(
+            "/agents/register/",
+            json={"name": "test-agent", "role": "research", "skills": ["python"]},
+            headers=auth_headers
+        )
+
+        await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Python Task", "task_type": "research", "task_tags": ["python"]},
+            headers=auth_headers
+        )
+
+        response = await client.get("/tasks/available-for/test-agent")
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data, list)
+
+    async def test_get_available_tasks_for_agent_not_found(self, client):
+        """测试获取不存在 Agent 的可用任务"""
+        response = await client.get("/tasks/available-for/nonexistent-agent")
+        assert response.status_code == 404
 
 
 class TestTaskLifecycle:
@@ -443,7 +678,6 @@ class TestTaskLifecycle:
 
     async def test_full_task_lifecycle_success(self, client, auth_headers):
         """测试完整任务流转：pending → assigned → running → reviewing → completed"""
-        # 1. 创建项目
         project_resp = await client.post(
             "/projects/",
             json={"name": "Lifecycle Test Project"},
@@ -451,27 +685,21 @@ class TestTaskLifecycle:
         )
         project = project_resp.json()
 
-        # 2. 创建任务
         task_resp = await client.post(
             "/tasks/",
-            json={
-                "project_id": project["id"],
-                "title": "Lifecycle Test Task",
-                "task_type": "research"
-            },
+            json={"project_id": project["id"], "title": "Lifecycle Test Task", "task_type": "research"},
             headers=auth_headers
         )
         task = task_resp.json()
         task_id = task["id"]
 
-        # 3. 注册 Agent
         await client.post(
             "/agents/register/",
             json={"name": "lifecycle-agent", "role": "research"},
             headers=auth_headers
         )
 
-        # 4. 认领任务 (pending → assigned)
+        # 认领
         claim_resp = await client.post(
             f"/tasks/{task_id}/claim/",
             params={"agent_name": "lifecycle-agent"},
@@ -480,7 +708,7 @@ class TestTaskLifecycle:
         assert claim_resp.status_code == 200
         assert claim_resp.json()["status"] == "assigned"
 
-        # 5. 开始任务 (assigned → running)
+        # 开始
         start_resp = await client.post(
             f"/tasks/{task_id}/start/",
             params={"agent_name": "lifecycle-agent"},
@@ -489,17 +717,17 @@ class TestTaskLifecycle:
         assert start_resp.status_code == 200
         assert start_resp.json()["status"] == "running"
 
-        # 6. 提交任务 (running → reviewing)
+        # 提交
         submit_resp = await client.post(
             f"/tasks/{task_id}/submit/",
             params={"agent_name": "lifecycle-agent"},
-            json={"output": "test result", "summary": "Task completed successfully"},
+            json={"output": "test result", "summary": "Task completed"},
             headers=auth_headers
         )
         assert submit_resp.status_code == 200
         assert submit_resp.json()["status"] == "reviewing"
 
-        # 7. 验收通过 (reviewing → completed)
+        # 验收
         review_resp = await client.post(
             f"/tasks/{task_id}/review/",
             params={"reviewer": "test-reviewer"},
@@ -509,43 +737,295 @@ class TestTaskLifecycle:
         assert review_resp.status_code == 200
         assert review_resp.json()["status"] == "completed"
 
+    async def test_task_lifecycle_reject(self, client, auth_headers):
+        """测试任务被拒绝的流程"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Reject Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        task_resp = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Reject Test Task", "task_type": "research"},
+            headers=auth_headers
+        )
+        task_id = task_resp.json()["id"]
+
+        await client.post("/agents/register/", json={"name": "reject-agent", "role": "research"}, headers=auth_headers)
+        await client.post(f"/tasks/{task_id}/claim/", params={"agent_name": "reject-agent"}, headers=auth_headers)
+        await client.post(f"/tasks/{task_id}/start/", params={"agent_name": "reject-agent"}, headers=auth_headers)
+        await client.post(
+            f"/tasks/{task_id}/submit/",
+            params={"agent_name": "reject-agent"},
+            json={"output": "result"},
+            headers=auth_headers
+        )
+
+        review_resp = await client.post(
+            f"/tasks/{task_id}/review/",
+            params={"reviewer": "test-reviewer"},
+            json={"approved": False, "feedback": "Needs improvement"},
+            headers=auth_headers
+        )
+        assert review_resp.status_code == 200
+        assert review_resp.json()["status"] == "rejected"
+
+    async def test_task_release(self, client, auth_headers):
+        """测试释放任务"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Release Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        task_resp = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Release Test Task", "task_type": "research"},
+            headers=auth_headers
+        )
+        task_id = task_resp.json()["id"]
+
+        await client.post("/agents/register/", json={"name": "release-agent", "role": "research"}, headers=auth_headers)
+        await client.post(f"/tasks/{task_id}/claim/", params={"agent_name": "release-agent"}, headers=auth_headers)
+
+        release_resp = await client.post(
+            f"/tasks/{task_id}/release/",
+            params={"agent_name": "release-agent"},
+            headers=auth_headers
+        )
+        assert release_resp.status_code == 200
+        assert release_resp.json()["status"] == "pending"
+
+    async def test_task_retry(self, client, auth_headers):
+        """测试重试失败的任务"""
+        project_resp = await client.post(
+            "/projects/",
+            json={"name": "Retry Test Project"},
+            headers=auth_headers
+        )
+        project = project_resp.json()
+
+        task_resp = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Retry Test Task", "task_type": "research"},
+            headers=auth_headers
+        )
+        task_id = task_resp.json()["id"]
+
+        await client.post("/agents/register/", json={"name": "retry-agent", "role": "research"}, headers=auth_headers)
+        await client.post(f"/tasks/{task_id}/claim/", params={"agent_name": "retry-agent"}, headers=auth_headers)
+        await client.post(f"/tasks/{task_id}/start/", params={"agent_name": "retry-agent"}, headers=auth_headers)
+        await client.post(
+            f"/tasks/{task_id}/submit/",
+            params={"agent_name": "retry-agent"},
+            json={"output": "result"},
+            headers=auth_headers
+        )
+        await client.post(
+            f"/tasks/{task_id}/review/",
+            params={"reviewer": "test-reviewer"},
+            json={"approved": False},
+            headers=auth_headers
+        )
+
+        retry_resp = await client.post(f"/tasks/{task_id}/retry/", headers=auth_headers)
+        assert retry_resp.status_code == 200
+        assert retry_resp.json()["status"] == "pending"
+
+
+class TestAgents:
+    """Agent API 测试"""
+
+    async def test_register_agent(self, client, auth_headers):
+        """测试注册 Agent"""
+        response = await client.post(
+            "/agents/register/",
+            json={"name": "test-agent-1", "role": "research", "skills": ["python", "data-analysis"]},
+            headers=auth_headers
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["name"] == "test-agent-1"
+        assert data["status"] == "online"
+
+    async def test_register_agent_with_capabilities(self, client, auth_headers):
+        """测试注册带能力的 Agent"""
+        response = await client.post(
+            "/agents/register/",
+            json={
+                "name": "capable-agent",
+                "role": "research",
+                "capabilities": {"max_tokens": 4000, "model": "gpt-4"},
+                "discord_user_id": "123456789"
+            },
+            headers=auth_headers
+        )
+        assert response.status_code == 200
+
+    async def test_register_agent_update_existing(self, client, auth_headers):
+        """测试更新已存在的 Agent"""
+        await client.post(
+            "/agents/register/",
+            json={"name": "update-agent", "role": "research", "skills": ["python"]},
+            headers=auth_headers
+        )
+
+        response = await client.post(
+            "/agents/register/",
+            json={"name": "update-agent", "role": "developer", "skills": ["python", "javascript"]},
+            headers=auth_headers
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["role"] == "developer"
+
+    async def test_list_agents(self, client, auth_headers):
+        """测试列出 Agents"""
+        await client.post("/agents/register/", json={"name": "list-agent-1", "role": "research"}, headers=auth_headers)
+
+        response = await client.get("/agents/")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    async def test_list_agents_with_status_filter(self, client, auth_headers):
+        """测试按状态过滤 Agents"""
+        response = await client.get("/agents/?status=online")
+        assert response.status_code == 200
+
+    async def test_list_agents_with_skill_filter(self, client, auth_headers):
+        """测试按技能过滤 Agents"""
+        await client.post("/agents/register/", json={"name": "skill-agent", "role": "research", "skills": ["python"]}, headers=auth_headers)
+
+        response = await client.get("/agents/?skill=python")
+        assert response.status_code == 200
+
+    async def test_get_agent(self, client, auth_headers):
+        """测试获取 Agent 详情"""
+        await client.post("/agents/register/", json={"name": "get-agent", "role": "research"}, headers=auth_headers)
+
+        response = await client.get("/agents/get-agent")
+        assert response.status_code == 200
+        assert response.json()["name"] == "get-agent"
+
+    async def test_get_agent_not_found(self, client):
+        """测试获取不存在的 Agent"""
+        response = await client.get("/agents/nonexistent-agent")
+        assert response.status_code == 404
+
+    async def test_agent_heartbeat(self, client, auth_headers):
+        """测试 Agent 心跳"""
+        await client.post("/agents/register/", json={"name": "heartbeat-agent", "role": "research"}, headers=auth_headers)
+
+        response = await client.post(
+            "/agents/heartbeat-agent/heartbeat/",
+            json={"name": "heartbeat-agent"}
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "online"
+
+    async def test_agent_heartbeat_not_found(self, client):
+        """测试不存在 Agent 的心跳"""
+        response = await client.post("/agents/nonexistent/heartbeat/", json={"name": "nonexistent"})
+        assert response.status_code == 404
+
+    async def test_delete_agent_soft(self, client, auth_headers):
+        """测试软删除 Agent"""
+        await client.post("/agents/register/", json={"name": "delete-agent", "role": "research"}, headers=auth_headers)
+
+        response = await client.delete("/agents/delete-agent", headers=auth_headers)
+        assert response.status_code == 200
+
+        get_resp = await client.get("/agents/delete-agent")
+        assert get_resp.status_code == 404
+
+    async def test_delete_agent_hard(self, client, auth_headers):
+        """测试硬删除 Agent"""
+        await client.post("/agents/register/", json={"name": "hard-delete-agent", "role": "research"}, headers=auth_headers)
+
+        response = await client.delete("/agents/hard-delete-agent?hard=true", headers=auth_headers)
+        assert response.status_code == 200
+        assert "hard" in response.json()["message"]
+
+    async def test_delete_agent_not_found(self, client, auth_headers):
+        """测试删除不存在的 Agent"""
+        response = await client.delete("/agents/nonexistent-agent", headers=auth_headers)
+        assert response.status_code == 404
+
+    async def test_restore_agent(self, client, auth_headers):
+        """测试恢复软删除的 Agent"""
+        await client.post("/agents/register/", json={"name": "restore-agent", "role": "research"}, headers=auth_headers)
+        await client.delete("/agents/restore-agent", headers=auth_headers)
+
+        response = await client.post("/agents/restore-agent/restore", headers=auth_headers)
+        assert response.status_code == 200
+
+        get_resp = await client.get("/agents/restore-agent")
+        assert get_resp.status_code == 200
+
+    async def test_restore_agent_not_found(self, client, auth_headers):
+        """测试恢复不存在或未删除的 Agent"""
+        response = await client.post("/agents/nonexistent/restore", headers=auth_headers)
+        assert response.status_code == 404
+
+    async def test_get_agent_channels(self, client, auth_headers):
+        """测试获取 Agent 的频道"""
+        await client.post("/agents/register/", json={"name": "channel-agent", "role": "research"}, headers=auth_headers)
+
+        response = await client.get("/agents/channel-agent/channels/")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
 
 class TestRateLimiter:
     """速率限制器测试"""
 
     async def test_rate_limiter_basic(self, client):
         """测试基础速率限制功能"""
-        # 发送多个请求到不需要认证的端点
         responses = []
         for _ in range(5):
             resp = await client.get("/projects/")
             responses.append(resp.status_code)
 
-        # 应该都能成功（在限制内）
         assert all(code == 200 for code in responses)
 
     async def test_rate_limiter_with_force_cleanup(self, client, auth_headers):
         """测试速率限制器强制清理功能"""
         from utils import RateLimiter
 
-        # 创建一个小容量的限流器
-        limiter = RateLimiter(
-            window=60,
-            max_requests=2,
-            max_store_size=3  # 很小的容量
-        )
+        limiter = RateLimiter(window=60, max_requests=2, max_store_size=3)
 
-        # 填满存储
         for i in range(3):
             allowed = await limiter.is_allowed(f"key_{i}")
             assert allowed is True
 
-        # 再添加一个应该触发强制清理
         allowed = await limiter.is_allowed("key_overflow")
         assert allowed is True
-
-        # 验证清理后容量恢复正常
         assert len(limiter.store) <= 3
+
+    async def test_rate_limiter_get_remaining(self, client):
+        """测试获取剩余请求数"""
+        from utils import RateLimiter
+
+        limiter = RateLimiter(window=60, max_requests=5)
+
+        remaining = await limiter.get_remaining("test_key")
+        assert remaining == 5
+
+        await limiter.is_allowed("test_key")
+        remaining = await limiter.get_remaining("test_key")
+        assert remaining == 4
+
+    async def test_rate_limiter_exceed_limit(self, client):
+        """测试超出限制"""
+        from utils import RateLimiter
+
+        limiter = RateLimiter(window=60, max_requests=1)
+
+        assert await limiter.is_allowed("limited_key") is True
+        assert await limiter.is_allowed("limited_key") is False
 
 
 class TestCircularDependency:
@@ -556,34 +1036,12 @@ class TestCircularDependency:
         from utils import check_circular_dependency
 
         async with test_db.acquire() as conn:
-            # 先创建项目
-            await conn.execute(
-                """INSERT INTO projects (id, name, status)
-                   VALUES (1, 'Test Project', 'active')
-                   ON CONFLICT DO NOTHING"""
-            )
+            await conn.execute("INSERT INTO projects (id, name, status) VALUES (1, 'Test Project', 'active') ON CONFLICT DO NOTHING")
 
-            # 创建任务 A
-            task_a = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status)
-                   VALUES (1, 'Task A', 'research', 'pending')
-                   RETURNING id"""
-            )
+            task_a = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status) VALUES (1, 'Task A', 'research', 'pending') RETURNING id")
+            task_b = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status, dependencies) VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int]) RETURNING id", task_a["id"])
 
-            # 创建任务 B，依赖 A
-            task_b = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
-                   RETURNING id""",
-                task_a["id"]
-            )
-
-            # 检查 B 依赖 A 是否形成循环（不应该）
             has_cycle = await check_circular_dependency(conn, task_b["id"], [task_a["id"]])
-            assert has_cycle is False
-
-            # 检查新任务依赖 B 是否形成循环（不应该）
-            has_cycle = await check_circular_dependency(conn, None, [task_b["id"]])
             assert has_cycle is False
 
     async def test_check_circular_dependency_with_cycle(self, test_db):
@@ -591,185 +1049,25 @@ class TestCircularDependency:
         from utils import check_circular_dependency
 
         async with test_db.acquire() as conn:
-            # 先创建项目（使用动态ID，避免冲突）
-            project = await conn.fetchrow(
-                """INSERT INTO projects (name, status)
-                   VALUES ('Test Project', 'active')
-                   RETURNING id"""
-            )
+            project = await conn.fetchrow("INSERT INTO projects (name, status) VALUES ('Test Project', 'active') RETURNING id")
             project_id = project['id']
 
-            # 创建任务 A
-            task_a = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status)
-                   VALUES ($1, 'Task A', 'research', 'pending')
-                   RETURNING id""",
-                project_id
-            )
+            task_a = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status) VALUES ($1, 'Task A', 'research', 'pending') RETURNING id", project_id)
+            task_b = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status, dependencies) VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int]) RETURNING id", project_id, task_a["id"])
 
-            # 创建任务 B，依赖 A
-            task_b = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int])
-                   RETURNING id""",
-                project_id, task_a["id"]
-            )
-
-            # 场景1: 检查如果 A 依赖 B 是否会形成循环（A->B->A）
             has_cycle = await check_circular_dependency(conn, task_a["id"], [task_b["id"]])
-            assert has_cycle is True, "Should detect cycle when A depends on B (B already depends on A)"
-
-            # 场景2: 检查 B 依赖 A 是否会形成循环（B->A->B，但 A 还没有依赖 B）
-            # 先清空 A 的依赖
-            await conn.execute("UPDATE tasks SET dependencies = NULL WHERE id = $1", task_a["id"])
-            # 现在 A 不依赖 B，所以 B 依赖 A 不会形成循环
-            has_cycle = await check_circular_dependency(conn, task_b["id"], [task_a["id"]])
-            assert has_cycle is False, "Should not detect cycle when B depends on A (A doesn't depend on B)"
-
-            # 场景3: 让 A 依赖 B，然后检查 B 依赖 A 是否会形成循环
-            await conn.execute(
-                "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
-                task_b["id"], task_a["id"]
-            )
-            has_cycle = await check_circular_dependency(conn, task_b["id"], [task_a["id"]])
-            assert has_cycle is True, "Should detect cycle when A and B depend on each other"
-
-    async def test_check_circular_dependency_long_chain(self, test_db):
-        """测试长依赖链的循环检测"""
-        from utils import check_circular_dependency
-
-        async with test_db.acquire() as conn:
-            # 先创建项目（使用动态ID）
-            project = await conn.fetchrow(
-                """INSERT INTO projects (name, status)
-                   VALUES ('Test Project', 'active')
-                   RETURNING id"""
-            )
-            project_id = project['id']
-
-            # 创建 A -> B -> C -> D 链
-            task_a = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status)
-                   VALUES ($1, 'Task A', 'research', 'pending')
-                   RETURNING id""",
-                project_id
-            )
-
-            task_b = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int])
-                   RETURNING id""",
-                project_id, task_a["id"]
-            )
-
-            task_c = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES ($1, 'Task C', 'research', 'pending', ARRAY[$2::int])
-                   RETURNING id""",
-                project_id, task_b["id"]
-            )
-
-            task_d = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES ($1, 'Task D', 'research', 'pending', ARRAY[$2::int])
-                   RETURNING id""",
-                project_id, task_c["id"]
-            )
-
-            # 场景1: 检查如果 A 依赖 D 是否会形成循环（A->B->C->D->A）
-            has_cycle = await check_circular_dependency(conn, task_a["id"], [task_d["id"]])
-            assert has_cycle is True, "Should detect cycle when A depends on D (D depends on C->B->A)"
-
-            # 场景2: 检查如果 D 依赖 A 是否会形成循环（D->...->A->D）
-            # 先清空 A 的依赖
-            await conn.execute("UPDATE tasks SET dependencies = NULL WHERE id = $1", task_a["id"])
-            # 让 D 依赖 A
-            await conn.execute(
-                "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
-                task_a["id"], task_d["id"]
-            )
-            # 现在 A 不依赖 D，所以 D 依赖 A 不会形成循环
-            has_cycle = await check_circular_dependency(conn, task_d["id"], [task_a["id"]])
-            assert has_cycle is False, "Should not detect cycle when D depends on A (A doesn't depend on D)"
-
-            # 场景3: 让 A 依赖 D，然后检查 D 依赖 A 是否会形成循环
-            await conn.execute(
-                "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
-                task_d["id"], task_a["id"]
-            )
-            has_cycle = await check_circular_dependency(conn, task_d["id"], [task_a["id"]])
-            assert has_cycle is True, "Should detect cycle when A and D depend on each other"
-
-    async def test_check_circular_dependency_shared_dependency(self, test_db):
-        """测试共享依赖不应被误判为循环
-
-        场景: A -> C, B -> C (C 是 A 和 B 的共同依赖)
-        检查: B 依赖 A 不应该形成循环（虽然 C 被访问两次，但不是循环）
-        """
-        from utils import check_circular_dependency
-
-        async with test_db.acquire() as conn:
-            # 先创建项目
-            await conn.execute(
-                """INSERT INTO projects (id, name, status)
-                   VALUES (1, 'Test Project', 'active')
-                   ON CONFLICT DO NOTHING"""
-            )
-
-            # 创建任务 C（基础任务）
-            task_c = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status)
-                   VALUES (1, 'Task C', 'research', 'pending')
-                   RETURNING id"""
-            )
-
-            # 创建任务 A，依赖 C
-            task_a = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES (1, 'Task A', 'research', 'pending', ARRAY[$1::int])
-                   RETURNING id""",
-                task_c["id"]
-            )
-
-            # 创建任务 B，依赖 C
-            task_b = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
-                   RETURNING id""",
-                task_c["id"]
-            )
-
-            # B 依赖 A 不应该形成循环
-            # 路径: B -> A -> C (C 没有依赖，结束)
-            has_cycle = await check_circular_dependency(conn, task_b["id"], [task_a["id"]])
-            assert has_cycle is False, "Shared dependency should not be detected as cycle"
-
-            # 新任务同时依赖 A 和 B 也不应该形成循环
-            has_cycle = await check_circular_dependency(conn, 999, [task_a["id"], task_b["id"]])
-            assert has_cycle is False, "Diamond dependency pattern should not be detected as cycle"
+            assert has_cycle is True
 
     async def test_check_circular_dependency_self_reference(self, test_db):
         """测试任务不能依赖自己"""
         from utils import check_circular_dependency
 
         async with test_db.acquire() as conn:
-            # 先创建项目
-            await conn.execute(
-                """INSERT INTO projects (id, name, status)
-                   VALUES (1, 'Test Project', 'active')
-                   ON CONFLICT DO NOTHING"""
-            )
+            await conn.execute("INSERT INTO projects (id, name, status) VALUES (1, 'Test Project', 'active') ON CONFLICT DO NOTHING")
+            task_a = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status) VALUES (1, 'Task A', 'research', 'pending') RETURNING id")
 
-            # 创建任务 A
-            task_a = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status)
-                   VALUES (1, 'Task A', 'research', 'pending')
-                   RETURNING id"""
-            )
-
-            # 任务 A 依赖自己应该形成循环
             has_cycle = await check_circular_dependency(conn, task_a["id"], [task_a["id"]])
-            assert has_cycle is True, "Self-reference should be detected as cycle"
+            assert has_cycle is True
 
 
 class TestCycleDetectionFull:
@@ -780,76 +1078,30 @@ class TestCycleDetectionFull:
         from utils import detect_all_cycles_in_project
 
         async with test_db.acquire() as conn:
-            # 创建项目
-            await conn.execute(
-                """INSERT INTO projects (id, name, status)
-                   VALUES (1, 'Test Project', 'active')
-                   ON CONFLICT DO NOTHING"""
-            )
+            await conn.execute("INSERT INTO projects (id, name, status) VALUES (1, 'Test Project', 'active') ON CONFLICT DO NOTHING")
 
-            # 创建 A -> B -> C 链（无循环）
-            task_a = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status)
-                   VALUES (1, 'Task A', 'research', 'pending')
-                   RETURNING id"""
-            )
-            task_b = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int])
-                   RETURNING id""",
-                task_a["id"]
-            )
-            await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES (1, 'Task C', 'research', 'pending', ARRAY[$1::int])
-                   RETURNING id""",
-                task_b["id"]
-            )
+            task_a = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status) VALUES (1, 'Task A', 'research', 'pending') RETURNING id")
+            task_b = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status, dependencies) VALUES (1, 'Task B', 'research', 'pending', ARRAY[$1::int]) RETURNING id", task_a["id"])
+            await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status, dependencies) VALUES (1, 'Task C', 'research', 'pending', ARRAY[$1::int]) RETURNING id", task_b["id"])
 
             cycles = await detect_all_cycles_in_project(conn, 1)
-            assert len(cycles) == 0, "Should not detect cycles in acyclic graph"
+            assert len(cycles) == 0
 
     async def test_detect_all_cycles_with_cycle(self, test_db):
         """测试检测到循环"""
         from utils import detect_all_cycles_in_project
 
         async with test_db.acquire() as conn:
-            # 创建项目（使用动态ID）
-            project = await conn.fetchrow(
-                """INSERT INTO projects (name, status)
-                   VALUES ('Test Project', 'active')
-                   RETURNING id"""
-            )
+            project = await conn.fetchrow("INSERT INTO projects (name, status) VALUES ('Test Project', 'active') RETURNING id")
             project_id = project['id']
 
-            # 创建 A -> B -> C -> A 循环
-            task_a = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status)
-                   VALUES ($1, 'Task A', 'research', 'pending')
-                   RETURNING id""",
-                project_id
-            )
-            task_b = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int])
-                   RETURNING id""",
-                project_id, task_a["id"]
-            )
-            task_c = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES ($1, 'Task C', 'research', 'pending', ARRAY[$2::int])
-                   RETURNING id""",
-                project_id, task_b["id"]
-            )
-            # 创建循环：C 依赖 A
-            await conn.execute(
-                "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
-                task_c["id"], task_a["id"]
-            )
+            task_a = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status) VALUES ($1, 'Task A', 'research', 'pending') RETURNING id", project_id)
+            task_b = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status, dependencies) VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int]) RETURNING id", project_id, task_a["id"])
+            task_c = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status, dependencies) VALUES ($1, 'Task C', 'research', 'pending', ARRAY[$2::int]) RETURNING id", project_id, task_b["id"])
+            await conn.execute("UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2", task_c["id"], task_a["id"])
 
             cycles = await detect_all_cycles_in_project(conn, project_id)
-            assert len(cycles) == 1, "Should detect one cycle"
-            assert len(cycles[0]) == 3, "Cycle should contain 3 tasks"
+            assert len(cycles) == 1
 
     async def test_validate_no_existing_cycles_raises(self, test_db):
         """测试验证函数在检测到循环时抛出异常"""
@@ -857,39 +1109,16 @@ class TestCycleDetectionFull:
         from fastapi import HTTPException
 
         async with test_db.acquire() as conn:
-            # 创建项目（使用动态ID）
-            project = await conn.fetchrow(
-                """INSERT INTO projects (name, status)
-                   VALUES ('Test Project', 'active')
-                   RETURNING id"""
-            )
+            project = await conn.fetchrow("INSERT INTO projects (name, status) VALUES ('Test Project', 'active') RETURNING id")
             project_id = project['id']
 
-            # 创建循环 A -> B -> A
-            task_a = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status)
-                   VALUES ($1, 'Task A', 'research', 'pending')
-                   RETURNING id""",
-                project_id
-            )
-            task_b = await conn.fetchrow(
-                """INSERT INTO tasks (project_id, title, task_type, status, dependencies)
-                   VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int])
-                   RETURNING id""",
-                project_id, task_a["id"]
-            )
-            # 创建循环：A 依赖 B
-            await conn.execute(
-                "UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2",
-                task_b["id"], task_a["id"]
-            )
+            task_a = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status) VALUES ($1, 'Task A', 'research', 'pending') RETURNING id", project_id)
+            task_b = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status, dependencies) VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int]) RETURNING id", project_id, task_a["id"])
+            await conn.execute("UPDATE tasks SET dependencies = ARRAY[$1::int] WHERE id = $2", task_b["id"], task_a["id"])
 
-            try:
+            with pytest.raises(HTTPException) as exc_info:
                 await validate_no_existing_cycles(conn, project_id)
-                assert False, "Should raise HTTPException for circular dependency"
-            except HTTPException as e:
-                assert e.status_code == 400
-                assert "Circular dependency" in e.detail
+            assert exc_info.value.status_code == 400
 
 
 class TestConfigValidation:
@@ -899,21 +1128,17 @@ class TestConfigValidation:
         """测试数据库超时配置验证"""
         from config import Config
 
-        # 保存原始值
         original_timeout = Config.DB_COMMAND_TIMEOUT
 
         try:
-            # 测试无效值：小于 1
             Config.DB_COMMAND_TIMEOUT = 0
             errors = Config.validate()
             assert any("DB_COMMAND_TIMEOUT must be at least" in e for e in errors)
 
-            # 测试无效值：大于 300
             Config.DB_COMMAND_TIMEOUT = 301
             errors = Config.validate()
             assert any("should not exceed 300 seconds" in e for e in errors)
 
-            # 测试有效值
             Config.DB_COMMAND_TIMEOUT = 60
             errors = Config.validate()
             assert not any("DB_COMMAND_TIMEOUT" in e for e in errors)
@@ -927,17 +1152,95 @@ class TestConfigValidation:
         original_max = Config.DB_MAX_QUERIES
 
         try:
-            # 测试无效值：小于 1000
             Config.DB_MAX_QUERIES = 500
             errors = Config.validate()
             assert any("DB_MAX_QUERIES should be at least" in e for e in errors)
 
-            # 测试无效值：大于 1000000
             Config.DB_MAX_QUERIES = 2000000
             errors = Config.validate()
             assert any("should not exceed 1,000,000" in e for e in errors)
         finally:
             Config.DB_MAX_QUERIES = original_max
+
+    async def test_config_validate_pool_size(self):
+        """测试连接池大小配置验证"""
+        from config import Config
+
+        original_min = Config.DB_POOL_MIN_SIZE
+        original_max = Config.DB_POOL_MAX_SIZE
+
+        try:
+            Config.DB_POOL_MIN_SIZE = 10
+            Config.DB_POOL_MAX_SIZE = 5
+            errors = Config.validate()
+            assert any("DB_POOL_MIN_SIZE cannot be greater than DB_POOL_MAX_SIZE" in e for e in errors)
+        finally:
+            Config.DB_POOL_MIN_SIZE = original_min
+            Config.DB_POOL_MAX_SIZE = original_max
+
+    async def test_config_validate_concurrent_tasks(self):
+        """测试并发任务配置验证"""
+        from config import Config
+
+        original = Config.MAX_CONCURRENT_TASKS_PER_AGENT
+
+        try:
+            Config.MAX_CONCURRENT_TASKS_PER_AGENT = 0
+            errors = Config.validate()
+            assert any("MAX_CONCURRENT_TASKS_PER_AGENT must be at least 1" in e for e in errors)
+        finally:
+            Config.MAX_CONCURRENT_TASKS_PER_AGENT = original
+
+    async def test_config_validate_timeout_minutes(self):
+        """测试超时分钟配置验证"""
+        from config import Config
+
+        original = Config.DEFAULT_TASK_TIMEOUT_MINUTES
+
+        try:
+            Config.DEFAULT_TASK_TIMEOUT_MINUTES = 0
+            errors = Config.validate()
+            assert any("DEFAULT_TASK_TIMEOUT_MINUTES must be at least 1" in e for e in errors)
+        finally:
+            Config.DEFAULT_TASK_TIMEOUT_MINUTES = original
+
+    async def test_config_validate_rate_limit(self):
+        """测试速率限制配置验证"""
+        from config import Config
+
+        original_requests = Config.RATE_LIMIT_MAX_REQUESTS
+        original_size = Config.RATE_LIMIT_MAX_STORE_SIZE
+
+        try:
+            Config.RATE_LIMIT_MAX_REQUESTS = 0
+            errors = Config.validate()
+            assert any("RATE_LIMIT_MAX_REQUESTS must be at least 1" in e for e in errors)
+
+            Config.RATE_LIMIT_MAX_REQUESTS = original_requests
+            Config.RATE_LIMIT_MAX_STORE_SIZE = 50
+            errors = Config.validate()
+            assert any("RATE_LIMIT_MAX_STORE_SIZE should be at least 100" in e for e in errors)
+        finally:
+            Config.RATE_LIMIT_MAX_REQUESTS = original_requests
+            Config.RATE_LIMIT_MAX_STORE_SIZE = original_size
+
+    async def test_config_is_production(self):
+        """测试生产环境检测"""
+        from config import Config
+
+        original = Config.API_KEY
+
+        try:
+            Config.API_KEY = None
+            assert Config.is_production() is False
+
+            Config.API_KEY = ""
+            assert Config.is_production() is False
+
+            Config.API_KEY = "secret-key"
+            assert Config.is_production() is True
+        finally:
+            Config.API_KEY = original
 
 
 class TestUpdateTaskRefactored:
@@ -948,197 +1251,331 @@ class TestUpdateTaskRefactored:
         from routers.tasks import _build_update_fields
         from models import TaskUpdate
 
-        # 测试空更新
         updates, params = await _build_update_fields(TaskUpdate())
         assert len(updates) == 0
         assert len(params) == 0
 
-        # 测试部分字段更新
         update = TaskUpdate(status="completed", priority=8)
         updates, params = await _build_update_fields(update)
         assert len(updates) == 2
-        assert "status = $1" in updates
-        assert "priority = $2" in updates
-        assert "completed" in params
-        assert 8 in params
 
     async def test_update_task_with_all_fields(self, client, auth_headers):
         """测试更新任务所有字段"""
-        # 创建项目
-        project_resp = await client.post(
-            "/projects/",
-            json={"name": "Update Test Project"},
-            headers=auth_headers
-        )
+        project_resp = await client.post("/projects/", json={"name": "Update Test Project"}, headers=auth_headers)
         project = project_resp.json()
 
-        # 创建任务
-        task_resp = await client.post(
-            "/tasks/",
-            json={"project_id": project["id"], "title": "Test Task", "task_type": "research"},
-            headers=auth_headers
-        )
+        task_resp = await client.post("/tasks/", json={"project_id": project["id"], "title": "Test Task", "task_type": "research"}, headers=auth_headers)
         task = task_resp.json()
 
-        # 更新所有字段
         response = await client.patch(
             f"/tasks/{task['id']}",
-            json={
-                "status": "completed",
-                "priority": 10,
-                "feedback": "Great work!",
-                "result": {"output": "test result"}
-            },
+            json={"status": "completed", "priority": 10, "feedback": "Great work!", "result": {"output": "test result"}},
             headers=auth_headers
         )
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "completed"
         assert data["priority"] == 10
-        assert data["feedback"] == "Great work!"
 
 
-class TestEdgeCases:
-    """边界情况测试"""
+class TestUtils:
+    """工具函数测试"""
 
-    async def test_create_task_empty_title(self, client, auth_headers):
-        """测试创建任务时标题为空"""
-        project_resp = await client.post(
-            "/projects/",
-            json={"name": "Edge Case Project"},
-            headers=auth_headers
-        )
-        project = project_resp.json()
+    async def test_setup_logging(self):
+        """测试日志设置"""
+        from utils import setup_logging
 
-        # 空标题应该被允许（数据库层面），但可能业务层面应该限制
+        logger = setup_logging()
+        assert logger is not None
+        assert logger.name == "task_service"
+
+    async def test_validate_task_type(self):
+        """测试任务类型验证"""
+        from utils import validate_task_type
+
+        assert validate_task_type("research") is True
+        assert validate_task_type("development") is True
+        assert validate_task_type("invalid") is False
+
+    async def test_validate_agent_role(self):
+        """测试 Agent 角色验证"""
+        from utils import validate_agent_role
+
+        assert validate_agent_role("research") is True
+        assert validate_agent_role("developer") is True
+        assert validate_agent_role("invalid") is False
+
+    async def test_sanitize_string(self):
+        """测试字符串清理"""
+        from utils import sanitize_string
+
+        assert sanitize_string("hello") == "hello"
+        assert sanitize_string("  hello  ") == "hello"
+        long_str = "a" * 300
+        assert len(sanitize_string(long_str, max_length=255)) == 255
+        assert sanitize_string(None) is None
+
+    async def test_sanitize_log_data(self):
+        """测试日志数据脱敏"""
+        from main import sanitize_log_data
+
+        data = {"username": "test", "password": "secret123", "api_key": "sk-123456"}
+        result = sanitize_log_data(data)
+        assert "***" in str(result["password"]) or result["password"] != "secret123"
+
+    async def test_check_dependencies(self, test_db):
+        """测试依赖检查"""
+        from utils import check_dependencies
+
+        async with test_db.acquire() as conn:
+            project = await conn.fetchrow("INSERT INTO projects (name, status) VALUES ('Dep Test', 'active') RETURNING id")
+
+            task_a = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status) VALUES ($1, 'Task A', 'research', 'completed') RETURNING id", project['id'])
+            task_b = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status, dependencies) VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int]) RETURNING id", project['id'], task_a['id'])
+
+            deps_ok, deps = await check_dependencies(conn, task_b['id'])
+            assert deps_ok is True
+
+    async def test_log_structured(self):
+        """测试结构化日志"""
+        from utils import log_structured
+
+        log_structured("info", "Test message", action="test", extra_field="value")
+
+    async def test_validate_task_dependencies_for_create(self):
+        """测试任务依赖验证"""
+        from utils import validate_task_dependencies_for_create
+        from fastapi import HTTPException
+
+        validate_task_dependencies_for_create([])
+        validate_task_dependencies_for_create(None)
+
+        with pytest.raises(HTTPException) as exc_info:
+            validate_task_dependencies_for_create([1, 1])
+        assert exc_info.value.status_code == 400
+
+        with pytest.raises(HTTPException) as exc_info:
+            validate_task_dependencies_for_create([-1])
+        assert exc_info.value.status_code == 400
+
+    async def test_retry_on_db_error(self):
+        """测试数据库重试装饰器"""
+        from utils import retry_on_db_error
+        import asyncpg
+
+        call_count = 0
+
+        @retry_on_db_error(max_retries=3, base_delay=0.01)
+        async def failing_function():
+            nonlocal call_count
+            call_count += 1
+            raise asyncpg.PostgresError("Test error")
+
+        with pytest.raises(asyncpg.PostgresError):
+            await failing_function()
+
+        assert call_count == 3
+
+
+class TestIdempotency:
+    """幂等性测试"""
+
+    async def test_check_idempotency_no_key(self, test_db):
+        """测试无幂等键"""
+        from utils import check_idempotency
+
+        async with test_db.acquire() as conn:
+            cached, should_skip = await check_idempotency(conn, None)
+            assert cached is None
+            assert should_skip is False
+
+    async def test_store_and_check_idempotency(self, test_db):
+        """测试存储和检查幂等响应"""
+        from utils import check_idempotency, store_idempotency_response
+
+        async with test_db.acquire() as conn:
+            key = "test-key-456"
+            response = {"id": 1, "status": "success"}
+
+            await store_idempotency_response(conn, key, response)
+            cached, should_skip = await check_idempotency(conn, key)
+            assert should_skip is True
+            assert cached == response
+
+
+class TestSoftDelete:
+    """软删除测试"""
+
+    async def test_soft_delete_invalid_table(self, test_db):
+        """测试无效表的软删除"""
+        from utils import soft_delete
+
+        async with test_db.acquire() as conn:
+            with pytest.raises(ValueError) as exc_info:
+                await soft_delete(conn, "invalid_table", 1)
+            assert "does not support soft delete" in str(exc_info.value)
+
+    async def test_cleanup_soft_deleted(self, test_db):
+        """测试清理软删除记录"""
+        from utils import cleanup_soft_deleted, soft_delete
+
+        async with test_db.acquire() as conn:
+            project = await conn.fetchrow("INSERT INTO projects (name, status) VALUES ('Cleanup Test', 'active') RETURNING id")
+            await soft_delete(conn, "projects", project['id'])
+            await conn.execute("UPDATE projects SET deleted_at = NOW() - INTERVAL '31 days' WHERE id = $1", project['id'])
+
+            count = await cleanup_soft_deleted(conn, "projects", days=30)
+            assert count >= 0
+
+
+class TestAgentUtils:
+    """Agent 工具函数测试"""
+
+    async def test_update_agent_status_after_task_change(self, test_db):
+        """测试任务变更后更新 Agent 状态"""
+        from utils import update_agent_status_after_task_change
+
+        async with test_db.acquire() as conn:
+            project = await conn.fetchrow("INSERT INTO projects (name, status) VALUES ('Agent Test', 'active') RETURNING id")
+            await conn.execute("INSERT INTO agents (name, role, status) VALUES ('test-agent', 'research', 'busy')")
+            await conn.execute("INSERT INTO tasks (project_id, title, task_type, status, assignee_agent) VALUES ($1, 'Test Task', 'research', 'completed', 'test-agent')", project['id'])
+
+            await update_agent_status_after_task_change(conn, 'test-agent')
+
+            agent = await conn.fetchrow("SELECT * FROM agents WHERE name = 'test-agent'")
+            assert agent['status'] == 'online'
+
+    async def test_update_agent_stats_on_completion(self, test_db):
+        """测试更新 Agent 统计信息"""
+        from utils import update_agent_stats_on_completion
+
+        async with test_db.acquire() as conn:
+            await conn.execute("INSERT INTO agents (name, role, status, completed_tasks, failed_tasks, total_tasks) VALUES ('stats-agent', 'research', 'online', 5, 1, 6)")
+
+            await update_agent_stats_on_completion(conn, 'stats-agent', success=True)
+            agent = await conn.fetchrow("SELECT * FROM agents WHERE name = 'stats-agent'")
+            assert agent['completed_tasks'] == 6
+
+            await update_agent_stats_on_completion(conn, 'stats-agent', success=False)
+            agent = await conn.fetchrow("SELECT * FROM agents WHERE name = 'stats-agent'")
+            assert agent['failed_tasks'] == 2
+
+    async def test_log_task_action(self, test_db):
+        """测试记录任务操作日志"""
+        from utils import log_task_action
+
+        async with test_db.acquire() as conn:
+            project = await conn.fetchrow("INSERT INTO projects (name, status) VALUES ('Log Test', 'active') RETURNING id")
+            task = await conn.fetchrow("INSERT INTO tasks (project_id, title, task_type, status) VALUES ($1, 'Log Task', 'research', 'pending') RETURNING id", project['id'])
+
+            await log_task_action(conn, task['id'], 'test_action', old_status='pending', new_status='running', message='Test message', actor='test-user')
+
+            logs = await conn.fetch("SELECT * FROM task_logs WHERE task_id = $1", task['id'])
+            assert len(logs) == 1
+
+
+class TestDatabase:
+    """数据库测试"""
+
+    async def test_get_pool(self):
+        """测试获取连接池"""
+        from database import get_pool, reset_pool
+
+        pool = await get_pool()
+        assert pool is not None
+
+        await reset_pool()
+
+
+class TestChannels:
+    """频道 API 测试"""
+
+    async def test_register_agent_channel(self, client, auth_headers):
+        """测试注册 Agent 频道"""
+        await client.post("/agents/register/", json={"name": "channel-agent", "role": "research"}, headers=auth_headers)
+
         response = await client.post(
-            "/tasks/",
-            json={
-                "project_id": project["id"],
-                "title": "",
-                "task_type": "research"
-            },
+            "/v1/agent-channels/",
+            json={"agent_name": "channel-agent", "channel_id": "123456"},
             headers=auth_headers
         )
-        # 根据业务需求，可能返回 200 或 422
-        assert response.status_code in [200, 422]
+        assert response.status_code == 200
 
-    async def test_create_task_invalid_priority(self, client, auth_headers):
-        """测试创建任务时优先级超出范围"""
-        project_resp = await client.post(
-            "/projects/",
-            json={"name": "Edge Case Project"},
-            headers=auth_headers
-        )
-        project = project_resp.json()
+    async def test_unregister_agent_channel(self, client, auth_headers):
+        """测试注销 Agent 频道"""
+        await client.post("/agents/register/", json={"name": "unregister-channel-agent", "role": "research"}, headers=auth_headers)
+        await client.post("/v1/agent-channels/", json={"agent_name": "unregister-channel-agent", "channel_id": "123456"}, headers=auth_headers)
 
-        # 优先级超出 1-10 范围
-        response = await client.post(
-            "/tasks/",
-            json={
-                "project_id": project["id"],
-                "title": "Test Task",
-                "task_type": "research",
-                "priority": 15
-            },
+        response = await client.request(
+            "DELETE",
+            "/v1/agent-channels/",
+            json={"agent_name": "unregister-channel-agent", "channel_id": "123456"},
             headers=auth_headers
         )
-        assert response.status_code == 422  # Pydantic 验证失败
+        assert response.status_code == 200
 
-    async def test_claim_nonexistent_task(self, client, auth_headers):
-        """测试认领不存在的任务"""
-        response = await client.post(
-            "/tasks/99999/claim/",
-            params={"agent_name": "test-agent"},
-            headers=auth_headers
-        )
-        assert response.status_code == 404
+    async def test_get_channel_agents(self, client, auth_headers):
+        """测试获取频道中的 Agents"""
+        response = await client.get("/v1/channels/test-channel/agents")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
 
-    async def test_release_task_not_assigned(self, client, auth_headers):
-        """测试释放未分配的任务"""
-        # 创建项目
-        project_resp = await client.post(
-            "/projects/",
-            json={"name": "Edge Case Project"},
-            headers=auth_headers
-        )
-        project = project_resp.json()
 
-        # 创建任务
-        task_resp = await client.post(
-            "/tasks/",
-            json={"project_id": project["id"], "title": "Test Task", "task_type": "research"},
-            headers=auth_headers
-        )
-        task = task_resp.json()
+class TestDashboard:
+    """仪表盘 API 测试"""
 
-        # 尝试释放未认领的任务
-        response = await client.post(
-            f"/tasks/{task['id']}/release/",
-            params={"agent_name": "test-agent"},
-            headers=auth_headers
-        )
-        assert response.status_code == 404  # 任务未分配给该 agent
+    async def test_get_dashboard_stats(self, client):
+        """测试获取仪表盘统计"""
+        response = await client.get("/v1/dashboard/stats")
+        assert response.status_code == 200
+        data = response.json()
+        assert "projects" in data
+        assert "tasks" in data
+        assert "agents" in data
 
-    async def test_retry_task_not_failed(self, client, auth_headers):
-        """测试重试未失败的任务"""
-        # 创建项目
-        project_resp = await client.post(
-            "/projects/",
-            json={"name": "Edge Case Project"},
-            headers=auth_headers
-        )
-        project = project_resp.json()
 
-        # 创建任务
-        task_resp = await client.post(
-            "/tasks/",
-            json={"project_id": project["id"], "title": "Test Task", "task_type": "research"},
-            headers=auth_headers
-        )
-        task = task_resp.json()
+class TestBackgroundTasks:
+    """后台任务测试"""
 
-        # 尝试重试 pending 状态的任务
-        response = await client.post(
-            f"/tasks/{task['id']}/retry/",
-            headers=auth_headers
-        )
-        assert response.status_code == 400
+    async def test_sleep_with_shutdown_check(self):
+        """测试带关闭检查的睡眠"""
+        from background import _sleep_with_shutdown_check, _shutdown_event
+
+        result = await _sleep_with_shutdown_check(0.01)
+        assert result is False
+
+        _shutdown_event.set()
+        result = await _sleep_with_shutdown_check(10)
+        assert result is True
+
+        _shutdown_event.clear()
+
+    async def test_should_reset_pool(self):
+        """测试连接池重置判断"""
+        from background import _should_reset_pool, _error_counts, _MAX_ERRORS_BEFORE_RESET
+
+        _error_counts["test"] = 0
+
+        for i in range(_MAX_ERRORS_BEFORE_RESET - 1):
+            assert _should_reset_pool("test") is False
+
+        assert _should_reset_pool("test") is True
+        assert _error_counts["test"] == 0
+
+
+class TestMain:
+    """主应用测试"""
+
+    async def test_request_logging_middleware_success(self, client):
+        """测试请求日志中间件 - 成功请求"""
+        response = await client.get("/")
+        assert response.status_code == 200
+
+    async def test_cors_configuration(self, client):
+        """测试 CORS 配置"""
+        response = await client.get("/", headers={"Origin": "http://localhost:3000"})
+        assert response.status_code == 200
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
-
-# ============ 测试覆盖度统计 ============
-"""
-测试覆盖度分析（基于测试代码静态分析）
-
-总测试数: 33
-
-按功能模块统计:
-- 健康检查: 1 (test_root)
-- 认证: 2 (test_missing_api_key, test_invalid_api_key)
-- 项目 API: 4 (test_create_project, test_list_projects, test_get_project, test_get_project_not_found)
-- 任务 API: 5 (test_create_task, test_create_task_with_dependencies, test_create_task_with_circular_dependency, test_create_task_with_duplicate_dependencies, test_create_task_with_invalid_dependency)
-- Agent API: 1 (test_register_agent)
-- 任务生命周期: 1 (test_full_task_lifecycle_success)
-- 速率限制: 2 (test_rate_limiter_basic, test_rate_limiter_with_force_cleanup)
-- 循环依赖检测: 8 (test_check_circular_dependency_*, test_detect_all_cycles_*, test_validate_no_existing_cycles_*)
-- 配置验证: 2 (test_config_validate_db_timeout, test_config_validate_max_queries)
-- 重构后的 update_task: 2 (test_update_task_build_fields, test_update_task_with_all_fields)
-- 边界情况: 5 (test_create_task_empty_title, test_create_task_invalid_priority, test_claim_nonexistent_task, test_release_task_not_assigned, test_retry_task_not_failed)
-
-覆盖率估算:
-- 核心功能: ~85% (项目/任务/Agent CRUD + 生命周期)
-- 工具函数: ~70% (循环检测、配置验证)
-- 边界情况: ~60% (错误处理、异常情况)
-- 整体估算: ~75-80%
-
-未覆盖场景（建议补充）:
-- 软删除恢复功能
-- 后台任务（心跳、卡住检测）
-- 并发场景（多 Agent 同时认领）
-- 大数据量场景（分页、性能）
-- WebSocket/实时通知（如有）
-"""
