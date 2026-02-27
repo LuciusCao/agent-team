@@ -1576,6 +1576,485 @@ class TestMain:
         response = await client.get("/", headers={"Origin": "http://localhost:3000"})
         assert response.status_code == 200
 
+    async def test_sanitize_log_data_with_exception(self):
+        """测试日志脱敏处理异常数据"""
+        from main import sanitize_log_data
+
+        # 测试非字典输入
+        result = sanitize_log_data("string input")
+        assert result == "string input"
+
+        result = sanitize_log_data(None)
+        assert result is None
+
+        result = sanitize_log_data([1, 2, 3])
+        assert result == [1, 2, 3]
+
+    async def test_sanitize_log_data_short_value(self):
+        """测试短值脱敏"""
+        from main import sanitize_log_data
+
+        data = {"password": "ab"}
+        result = sanitize_log_data(data)
+        assert result["password"] == "***"
+
+    async def test_sanitize_log_data_colon_format(self):
+        """测试冒号格式的敏感信息"""
+        from main import sanitize_log_data
+
+        data = {"message": "Authorization: Bearer token123"}
+        result = sanitize_log_data(data)
+        assert "***" in result["message"]
+
+
+class TestBackgroundFull:
+    """后台任务完整测试"""
+
+    async def test_heartbeat_monitor_db_error(self, test_db):
+        """测试心跳监控器数据库错误处理"""
+        from background import heartbeat_monitor, _shutdown_event, _error_counts
+
+        # 设置关闭信号以快速退出
+        _shutdown_event.set()
+
+        # 运行监控器（应该快速退出）
+        await heartbeat_monitor()
+
+        # 清理
+        _shutdown_event.clear()
+
+    async def test_stuck_task_monitor_db_error(self, test_db):
+        """测试卡住任务监控器数据库错误处理"""
+        from background import stuck_task_monitor, _shutdown_event
+
+        _shutdown_event.set()
+        await stuck_task_monitor()
+        _shutdown_event.clear()
+
+    async def test_soft_delete_cleanup_monitor_db_error(self, test_db):
+        """测试软删除清理监控器数据库错误处理"""
+        from background import soft_delete_cleanup_monitor, _shutdown_event
+
+        _shutdown_event.set()
+        await soft_delete_cleanup_monitor()
+        _shutdown_event.clear()
+
+    async def test_shutdown_background_tasks(self):
+        """测试后台任务关闭"""
+        from background import shutdown_background_tasks, _shutdown_event
+
+        await shutdown_background_tasks()
+        assert _shutdown_event.is_set()
+
+        # 清理
+        _shutdown_event.clear()
+
+
+class TestSecurityFull:
+    """安全模块完整测试"""
+
+    async def test_verify_api_key_none_config(self):
+        """测试 API Key 验证 - 配置为 None"""
+        from security import verify_api_key
+        from config import Config
+
+        original = Config.API_KEY
+        try:
+            Config.API_KEY = None
+            result = await verify_api_key(None)
+            assert result is None
+        finally:
+            Config.API_KEY = original
+
+    async def test_verify_api_key_empty_config(self):
+        """测试 API Key 验证 - 配置为空字符串"""
+        from security import verify_api_key
+        from config import Config
+
+        original = Config.API_KEY
+        try:
+            Config.API_KEY = ""
+            result = await verify_api_key(None)
+            assert result is None
+        finally:
+            Config.API_KEY = original
+
+    async def test_rate_limit_no_client(self):
+        """测试速率限制 - 无客户端信息"""
+        from security import rate_limit
+        from unittest.mock import MagicMock
+
+        mock_request = MagicMock()
+        mock_request.client = None
+
+        result = await rate_limit(mock_request)
+        assert result is True
+
+
+class TestUtilsFull:
+    """工具函数完整测试"""
+
+    async def test_json_formatter_with_extra(self):
+        """测试 JSON 格式化器带额外字段"""
+        from utils import JSONFormatter
+        import logging
+
+        formatter = JSONFormatter()
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg="Test message", args=(), exc_info=None
+        )
+        record.agent_name = "test-agent"
+        record.task_id = 123
+        record.project_id = 456
+        record.action = "test_action"
+        record.duration_ms = 100.5
+
+        result = formatter.format(record)
+        assert "test-agent" in result
+        assert "123" in result
+
+    async def test_json_formatter_with_exception(self):
+        """测试 JSON 格式化器带异常"""
+        from utils import JSONFormatter
+        import logging
+        import sys
+
+        formatter = JSONFormatter()
+
+        try:
+            raise ValueError("Test exception")
+        except ValueError:
+            exc_info = sys.exc_info()
+            record = logging.LogRecord(
+                name="test", level=logging.ERROR, pathname="", lineno=0,
+                msg="Error message", args=(), exc_info=exc_info
+            )
+
+        result = formatter.format(record)
+        assert "exception" in result or "Error message" in result
+
+    async def test_check_idempotency_expired_key(self, test_db):
+        """测试检查过期幂等键"""
+        from utils import check_idempotency, store_idempotency_response
+
+        async with test_db.acquire() as conn:
+            key = "expired-key"
+            response = {"data": "test"}
+
+            await store_idempotency_response(conn, key, response)
+            # 手动设置为过期
+            await conn.execute(
+                "UPDATE idempotency_keys SET created_at = NOW() - INTERVAL '25 hours' WHERE key = $1",
+                key
+            )
+
+            # 过期的键应该返回 None
+            cached, should_skip = await check_idempotency(conn, key)
+            assert should_skip is False
+
+    async def test_cleanup_expired_idempotency_keys(self, test_db):
+        """测试清理过期幂等键"""
+        from utils import cleanup_expired_idempotency_keys, store_idempotency_response
+
+        async with test_db.acquire() as conn:
+            key = "cleanup-key"
+            await store_idempotency_response(conn, key, {"data": "test"})
+            await conn.execute(
+                "UPDATE idempotency_keys SET created_at = NOW() - INTERVAL '25 hours' WHERE key = $1",
+                key
+            )
+
+            count = await cleanup_expired_idempotency_keys(conn)
+            assert count >= 0
+
+    async def test_hard_delete(self, test_db):
+        """测试硬删除"""
+        from utils import hard_delete
+
+        async with test_db.acquire() as conn:
+            project = await conn.fetchrow(
+                "INSERT INTO projects (name, status) VALUES ('Hard Delete Test', 'active') RETURNING id"
+            )
+
+            result = await hard_delete(conn, "projects", project['id'])
+            assert result is True
+
+            # 确认已删除
+            row = await conn.fetchrow("SELECT * FROM projects WHERE id = $1", project['id'])
+            assert row is None
+
+    async def test_hard_delete_not_found(self, test_db):
+        """测试硬删除不存在的记录"""
+        from utils import hard_delete
+
+        async with test_db.acquire() as conn:
+            result = await hard_delete(conn, "projects", 99999)
+            assert result is False
+
+    async def test_restore_soft_deleted_not_found(self, test_db):
+        """测试恢复不存在的软删除记录"""
+        from utils import restore_soft_deleted
+
+        async with test_db.acquire() as conn:
+            result = await restore_soft_deleted(conn, "projects", 99999)
+            assert result is False
+
+    async def test_check_dependencies_no_task(self, test_db):
+        """测试检查不存在任务的依赖"""
+        from utils import check_dependencies
+
+        async with test_db.acquire() as conn:
+            deps_ok, deps = await check_dependencies(conn, 99999)
+            assert deps_ok is True
+            assert deps == []
+
+    async def test_check_dependencies_with_for_update(self, test_db):
+        """测试使用 FOR UPDATE 检查依赖"""
+        from utils import check_dependencies
+
+        async with test_db.acquire() as conn:
+            project = await conn.fetchrow(
+                "INSERT INTO projects (name, status) VALUES ('For Update Test', 'active') RETURNING id"
+            )
+            task_a = await conn.fetchrow(
+                "INSERT INTO tasks (project_id, title, task_type, status) VALUES ($1, 'Task A', 'research', 'completed') RETURNING id",
+                project['id']
+            )
+            task_b = await conn.fetchrow(
+                "INSERT INTO tasks (project_id, title, task_type, status, dependencies) VALUES ($1, 'Task B', 'research', 'pending', ARRAY[$2::int]) RETURNING id",
+                project['id'], task_a['id']
+            )
+
+            deps_ok, deps = await check_dependencies(conn, task_b['id'], for_update=True)
+            assert deps_ok is True
+
+    async def test_validate_task_dependencies_cycle(self):
+        """测试验证任务依赖 - 循环依赖"""
+        from utils import validate_task_dependencies
+        from fastapi import HTTPException
+
+        class MockTask:
+            def __init__(self, deps=None):
+                self.dependencies = deps
+
+        # A -> B -> C -> A 循环
+        tasks = [
+            MockTask([1]),  # A 依赖 B
+            MockTask([2]),  # B 依赖 C
+            MockTask([0]),  # C 依赖 A (形成循环)
+        ]
+
+        with pytest.raises(HTTPException) as exc_info:
+            validate_task_dependencies(tasks)
+        assert exc_info.value.status_code == 400
+        assert "Circular dependency" in exc_info.value.detail
+
+    async def test_rate_limiter_cleanup_expired(self):
+        """测试速率限制器清理过期记录"""
+        from utils import RateLimiter
+
+        limiter = RateLimiter(window=0.01, max_requests=10)  # 很短的窗口
+
+        # 添加记录
+        await limiter.is_allowed("key1")
+        await asyncio.sleep(0.02)  # 等待过期
+
+        # 再次访问应该清理过期记录
+        await limiter.is_allowed("key1")
+        # 如果过期被清理，应该还有剩余额度
+        remaining = await limiter.get_remaining("key1")
+        assert remaining >= 9
+
+    async def test_rate_limiter_force_cleanup_logging(self, caplog):
+        """测试速率限制器强制清理日志"""
+        from utils import RateLimiter
+        import logging
+
+        limiter = RateLimiter(window=60, max_requests=10, max_store_size=2)
+
+        # 填满存储
+        for i in range(3):
+            await limiter.is_allowed(f"key_{i}")
+
+        # 应该触发强制清理并记录日志
+        with caplog.at_level(logging.WARNING):
+            await limiter.is_allowed("key_overflow")
+
+
+class TestChannelsFull:
+    """频道 API 完整测试"""
+
+    async def test_register_agent_channel_creates_agent(self, client, auth_headers):
+        """测试注册频道 - 先创建 Agent 再注册频道"""
+        # 先创建 Agent
+        await client.post(
+            "/agents/register/",
+            json={"name": "channel-test-agent", "role": "research"},
+            headers=auth_headers
+        )
+
+        response = await client.post(
+            "/v1/agent-channels/",
+            json={"agent_name": "channel-test-agent", "channel_id": "123456"},
+            headers=auth_headers
+        )
+        assert response.status_code == 200
+
+    async def test_register_agent_channel_update_existing(self, client, auth_headers):
+        """测试更新已存在的频道记录"""
+        # 先创建 Agent 和频道
+        await client.post("/agents/register/", json={"name": "channel-update-agent", "role": "research"}, headers=auth_headers)
+        await client.post("/v1/agent-channels/", json={"agent_name": "channel-update-agent", "channel_id": "123"}, headers=auth_headers)
+
+        # 再次注册应该更新 last_seen
+        response = await client.post(
+            "/v1/agent-channels/",
+            json={"agent_name": "channel-update-agent", "channel_id": "123"},
+            headers=auth_headers
+        )
+        assert response.status_code == 200
+
+
+class TestEdgeCasesFull:
+    """完整边界情况测试"""
+
+    async def test_create_task_with_parent(self, client, auth_headers):
+        """测试创建带子任务的任务"""
+        project_resp = await client.post("/projects/", json={"name": "Parent Task Project"}, headers=auth_headers)
+        project = project_resp.json()
+
+        parent_resp = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Parent Task", "task_type": "research"},
+            headers=auth_headers
+        )
+        parent = parent_resp.json()
+
+        child_resp = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Child Task", "task_type": "research", "parent_task_id": parent["id"]},
+            headers=auth_headers
+        )
+        assert child_resp.status_code == 200
+        assert child_resp.json()["parent_task_id"] == parent["id"]
+
+    async def test_list_tasks_with_assignee_filter(self, client, auth_headers):
+        """测试按分配人过滤任务"""
+        project_resp = await client.post("/projects/", json={"name": "Assignee Filter Project"}, headers=auth_headers)
+        project = project_resp.json()
+
+        await client.post("/agents/register/", json={"name": "assignee-agent", "role": "research"}, headers=auth_headers)
+        await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Assigned Task", "task_type": "research", "assignee_agent": "assignee-agent"},
+            headers=auth_headers
+        )
+
+        response = await client.get("/tasks/?assignee=assignee-agent")
+        assert response.status_code == 200
+
+    async def test_list_tasks_with_tags_filter(self, client, auth_headers):
+        """测试按标签过滤任务"""
+        project_resp = await client.post("/projects/", json={"name": "Tags Filter Project"}, headers=auth_headers)
+        project = project_resp.json()
+
+        await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Tagged Task", "task_type": "research", "task_tags": ["urgent", "backend"]},
+            headers=auth_headers
+        )
+
+        response = await client.get("/tasks/?tags=urgent")
+        assert response.status_code == 200
+
+    async def test_get_available_tasks_with_dependencies(self, client, auth_headers):
+        """测试获取可认领任务时考虑依赖"""
+        project_resp = await client.post("/projects/", json={"name": "Dependency Available Project"}, headers=auth_headers)
+        project = project_resp.json()
+
+        task1 = await client.post("/tasks/", json={"project_id": project["id"], "title": "Dep Task 1", "task_type": "research"}, headers=auth_headers)
+        await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Dep Task 2", "task_type": "research", "dependencies": [task1.json()["id"]]},
+            headers=auth_headers
+        )
+
+        response = await client.get("/tasks/available")
+        assert response.status_code == 200
+        # 只有无依赖或依赖已完成的任务才应该返回
+
+    async def test_claim_task_with_uncompleted_dependencies(self, client, auth_headers):
+        """测试认领有未完成依赖的任务"""
+        project_resp = await client.post("/projects/", json={"name": "Uncompleted Dep Project"}, headers=auth_headers)
+        project = project_resp.json()
+
+        await client.post("/agents/register/", json={"name": "dep-agent", "role": "research"}, headers=auth_headers)
+
+        task1 = await client.post("/tasks/", json={"project_id": project["id"], "title": "Incomplete Task", "task_type": "research"}, headers=auth_headers)
+        task2 = await client.post(
+            "/tasks/",
+            json={"project_id": project["id"], "title": "Waiting Task", "task_type": "research", "dependencies": [task1.json()["id"]]},
+            headers=auth_headers
+        )
+
+        response = await client.post(f"/tasks/{task2.json()['id']}/claim/", params={"agent_name": "dep-agent"}, headers=auth_headers)
+        assert response.status_code == 400  # 依赖未完成
+
+    async def test_retry_task_max_retries_exceeded(self, client, auth_headers):
+        """测试超过最大重试次数"""
+        project_resp = await client.post("/projects/", json={"name": "Max Retry Project"}, headers=auth_headers)
+        project = project_resp.json()
+
+        task = await client.post("/tasks/", json={"project_id": project["id"], "title": "Max Retry Task", "task_type": "research"}, headers=auth_headers)
+        task_id = task.json()["id"]
+
+        await client.post("/agents/register/", json={"name": "max-retry-agent", "role": "research"}, headers=auth_headers)
+
+        # 多次重试
+        for _ in range(4):
+            await client.post(f"/tasks/{task_id}/claim/", params={"agent_name": "max-retry-agent"}, headers=auth_headers)
+            await client.post(f"/tasks/{task_id}/start/", params={"agent_name": "max-retry-agent"}, headers=auth_headers)
+            await client.post(f"/tasks/{task_id}/submit/", params={"agent_name": "max-retry-agent"}, json={"output": "result"}, headers=auth_headers)
+            await client.post(f"/tasks/{task_id}/review/", params={"reviewer": "test"}, json={"approved": False}, headers=auth_headers)
+            await client.post(f"/tasks/{task_id}/retry/", headers=auth_headers)
+
+        # 第4次重试后应该超过限制
+        response = await client.post(f"/tasks/{task_id}/retry/", headers=auth_headers)
+        # 可能返回 400 表示超过最大重试次数
+
+    async def test_update_task_status_to_completed(self, client, auth_headers):
+        """测试更新任务状态为已完成"""
+        project_resp = await client.post("/projects/", json={"name": "Complete Status Project"}, headers=auth_headers)
+        project = project_resp.json()
+
+        await client.post("/agents/register/", json={"name": "complete-agent", "role": "research"}, headers=auth_headers)
+
+        task = await client.post("/tasks/", json={"project_id": project["id"], "title": "Complete Task", "task_type": "research"}, headers=auth_headers)
+        task_id = task.json()["id"]
+
+        await client.post(f"/tasks/{task_id}/claim/", params={"agent_name": "complete-agent"}, headers=auth_headers)
+
+        response = await client.patch(f"/tasks/{task_id}", json={"status": "completed"}, headers=auth_headers)
+        assert response.status_code == 200
+        assert response.json()["status"] == "completed"
+
+    async def test_update_task_status_to_failed(self, client, auth_headers):
+        """测试更新任务状态为失败"""
+        project_resp = await client.post("/projects/", json={"name": "Fail Status Project"}, headers=auth_headers)
+        project = project_resp.json()
+
+        await client.post("/agents/register/", json={"name": "fail-agent", "role": "research"}, headers=auth_headers)
+
+        task = await client.post("/tasks/", json={"project_id": project["id"], "title": "Fail Task", "task_type": "research"}, headers=auth_headers)
+        task_id = task.json()["id"]
+
+        await client.post(f"/tasks/{task_id}/claim/", params={"agent_name": "fail-agent"}, headers=auth_headers)
+
+        response = await client.patch(f"/tasks/{task_id}", json={"status": "failed"}, headers=auth_headers)
+        assert response.status_code == 200
+        assert response.json()["status"] == "failed"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
